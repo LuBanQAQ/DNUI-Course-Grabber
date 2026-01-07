@@ -1,6 +1,6 @@
 # 🚀 DNUI Course Grabber
 
-> 东软（大连东软信息学院）自动抢课脚本 —— 智能识别无冲突课程，定时抢课，快人一步！
+> 大连东软信息学院自动抢课脚本 —— 智能识别无冲突课程，定时抢课，快人一步！
 
 ## ✨ 功能特性
 
@@ -184,29 +184,10 @@
 
 欢迎提交 Issue 和 Pull Request！
 
-### 开发相关
-```bash
-# 克隆仓库
-git clone https://github.com/LuBanQAQ/DNUI-Course-Grabber.git
-
-# 修改代码
-# 在浏览器中测试
-
-# 提交更改
-git add .
-git commit -m "描述你的修改"
-git push origin main
-```
-
 ## 📄 开源协议
 
 本项目采用 MIT 协议开源
 
-## 👨‍💻 作者
-
-**LuBanQAQ**
-
-- GitHub: [@LuBanQAQ](https://github.com/LuBanQAQ)
 
 ## 🌟 Star History
 
