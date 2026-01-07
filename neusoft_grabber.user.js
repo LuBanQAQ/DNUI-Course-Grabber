@@ -167,13 +167,6 @@
                 <span class="nscg-label">点击冷却(ms):</span>
                 <input type="number" id="nscg-interval" class="nscg-input" value="1500" min="1" step="100" placeholder="点击后的等待时间">
             </div>
-            <div class="nscg-row">
-                 <label style="cursor:pointer;display:flex;align-items:center;font-size:12px;color:#606266;flex:1;">
-                    <input type="checkbox" id="nscg-keepalive" checked>
-                    <span style="margin-left:4px;">WebVPN保活(分):</span>
-                    <input type="number" id="nscg-keepalive-interval" class="nscg-input" value="3" min="1" style="margin-left:5px;width:50px;">
-                </label>
-            </div>
             
             <button id="nscg-toggle-btn" class="nscg-btn">🔥 开始抢课</button>
             <button id="nscg-clear-btn" class="nscg-btn" style="background:#909399;margin-top:8px;font-size:12px;padding:6px;">清空日志</button>
@@ -202,8 +195,6 @@
     const intervalInput = document.getElementById('nscg-interval');
     const keywordInput = document.getElementById('nscg-keyword');
     const trapInput = document.getElementById('nscg-trap');
-    const keepAliveCheck = document.getElementById('nscg-keepalive');
-    const keepAliveInput = document.getElementById('nscg-keepalive-interval');
 
     // Init Start Time to Now
     const now = new Date();
@@ -229,9 +220,7 @@
             keyword: keywordInput.value,
             trap: trapInput.checked,
             retry: retryInput.value,
-            interval: intervalInput.value,
-            keepAlive: keepAliveCheck.checked,
-            keepAliveInterval: keepAliveInput.value
+            interval: intervalInput.value
         };
         localStorage.setItem('nscg_config', JSON.stringify(config));
     }
@@ -246,8 +235,6 @@
                 if(c.trap !== undefined) trapInput.checked = c.trap;
                 if(c.retry) retryInput.value = c.retry;
                 if(c.interval) intervalInput.value = c.interval;
-                if(c.keepAlive !== undefined) keepAliveCheck.checked = c.keepAlive;
-                if(c.keepAliveInterval) keepAliveInput.value = c.keepAliveInterval;
             } catch(e) {}
         }
     }
@@ -479,49 +466,6 @@
         
         log(`任务结束: ${reason}`, 'error');
     }
-
-    // --- WebVPN Keep Alive ---
-    function keepAliveTick() {
-        if (!keepAliveCheck.checked) return;
-
-        const intervalMinutes = parseFloat(keepAliveInput.value) || 3;
-        const intervalMs = intervalMinutes * 60 * 1000;
-        
-        // 1. 临近抢课不刷新 (例如开始前 5 分钟)
-        if (startTimeInput.value) {
-            const startTime = new Date(startTimeInput.value).getTime();
-            const now = Date.now();
-            const diff = startTime - now;
-             
-            // 如果距离开始时间小于 5 分钟，且还没过开始时间，则暂停刷新
-            if (diff > 0 && diff < 5 * 60 * 1000) {
-                 return; // 马上要开始了，保持静止
-            }
-            // 如果已经开始抢课，也暂停
-            if (isRunning) return; 
-        }
-
-        // 2. 检查上次刷新时间
-        const lastReloadStr = localStorage.getItem('nscg_last_reload');
-        const now = Date.now();
-        let lastReload = lastReloadStr ? parseInt(lastReloadStr) : 0;
-        
-        // 如果距离上次刷新超过了设定间隔 (且页面至少活跃了10秒，防止无限循环刷新)
-        if (now - lastReload > intervalMs) {
-            // 安全检查：如果页面刚刚加载不到10秒，不要再次刷新，可能是逻辑错误
-            if (performance.now() < 10000) return;
-
-            log('🔄 [WebVPN保活] 页面即将刷新...', 'info');
-            saveConfig();
-            localStorage.setItem('nscg_last_reload', now);
-            setTimeout(() => window.location.reload(), 1000);
-        }
-    }
-    
-    // 启动保活定时器 (30秒检查一次)
-    setInterval(keepAliveTick, 30 * 1000);
-    // 脚本加载后延迟检查一次
-    setTimeout(keepAliveTick, 5000);
 
     // Bind Events
     toggleBtn.addEventListener('click', toggle);
