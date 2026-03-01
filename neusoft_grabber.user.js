@@ -302,62 +302,131 @@
 
     // --- Core Logic ---
 
-    // 1. Check Capacity (Example: "已选/容量：0/40")
-    function isFull(text) {
-        const match = text.match(/已选\/容量：\s*(\d+)\s*\/\s*(\d+)/);
-        if (match) {
-            const selected = parseInt(match[1], 10);
-            const capacity = parseInt(match[2], 10);
-            return selected >= capacity;
-        }
-        return false;
+    // 1. Check Capacity
+    function isFull(selected, capacity) {
+        const s = parseInt(selected, 10);
+        const c = parseInt(capacity, 10);
+        if (Number.isNaN(s) || Number.isNaN(c)) return false;
+        return s >= c;
     }
 
-    // 2. Find Available Lesson Button
-    function findBestLesson() {
-        const cards = document.querySelectorAll('.el-card.jxb-card');
+    function normalizeText(text) {
+        return (text || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function findFieldValueByLabel(card, labelKeyword) {
+        const items = card.querySelectorAll('.card-item');
+        for (const item of items) {
+            const labelEl = item.querySelector('.label');
+            const valueEl = item.querySelector('.value');
+            if (!labelEl || !valueEl) continue;
+            const label = normalizeText(labelEl.textContent);
+            if (label.includes(labelKeyword)) {
+                return normalizeText(valueEl.textContent);
+            }
+        }
+        return '';
+    }
+
+    function parseFirstNumber(text) {
+        const match = normalizeText(text).match(/\d+/);
+        return match ? parseInt(match[0], 10) : NaN;
+    }
+
+    function findBestLessonFromTable() {
+        const rows = document.querySelectorAll('tr.el-table__row');
         const keyword = keywordInput.value.trim();
         let matchCount = 0;
-        
+        let totalVisible = 0;
+
+        for (const row of rows) {
+            if (row.offsetParent === null) continue;
+            totalVisible++;
+
+            const cells = row.querySelectorAll('td');
+            const courseName = normalizeText(cells[1]?.textContent || '') || '未知课程';
+            const matchesKeyword = !keyword || courseName.includes(keyword);
+            if (matchesKeyword) matchCount++;
+            else continue;
+
+            const rowText = normalizeText(row.textContent);
+            const hasConflict = rowText.includes('课程冲突') || !!row.querySelector('.el-tag--danger');
+            if (hasConflict) continue;
+
+            const capacity = parseFirstNumber(cells[4]?.textContent || '');
+            const selected = parseFirstNumber(cells[5]?.textContent || '');
+            if (!Number.isNaN(capacity) && !Number.isNaN(selected) && isFull(selected, capacity)) {
+                continue;
+            }
+
+            const btns = row.querySelectorAll('button.el-button--primary');
+            for (const b of btns) {
+                if (normalizeText(b.innerText).includes('选择') && !b.disabled) {
+                    return { btn: b, name: courseName, matchCount, totalVisible };
+                }
+            }
+        }
+
+        return { btn: null, matchCount, totalVisible };
+    }
+
+    function findBestLessonFromCards() {
+        const cards = document.querySelectorAll('.course-list .el-card.jxb-card');
+        const keyword = keywordInput.value.trim();
+        let matchCount = 0;
+        let totalVisible = 0;
+
         for (let i = 0; i < cards.length; i++) {
             const card = cards[i];
-            
-            // Keyword Match
-            const nameEl = card.querySelector('.one-row');
-            const courseName = nameEl ? nameEl.innerText.trim() : '未知课程';
-            const matchesKeyword = !keyword || courseName.includes(keyword);
-            
-            if (matchesKeyword) matchCount++;
-            else continue; 
 
-            // Conflict Check
+            if (card.offsetParent === null) continue;
+            totalVisible++;
+
+            const courseName = findFieldValueByLabel(card, '课程名称') || '未知课程';
+            const matchesKeyword = !keyword || courseName.includes(keyword);
+
+            if (matchesKeyword) matchCount++;
+            else continue;
+
             const tags = card.querySelectorAll('.el-tag--danger');
             let hasConflict = false;
-            for(let t of tags) {
+            for (let t of tags) {
                 if (t.innerText.includes('冲突')) { hasConflict = true; break; }
             }
             if (!hasConflict && card.innerText.includes('课程冲突')) hasConflict = true;
             if (hasConflict) continue;
 
-            // Capacity Check
-            const items = card.querySelectorAll('.card-item');
             let full = false;
-            for(let item of items) {
-                if (item.innerText.includes('已选/容量')) {
-                    if (isFull(item.innerText)) { full = true; break; }
+            const selectedCount = findFieldValueByLabel(card, '已选人数');
+            const capacityCount = findFieldValueByLabel(card, '课容量');
+            if (selectedCount && capacityCount) {
+                full = isFull(selectedCount, capacityCount);
+            } else {
+                const text = normalizeText(card.textContent);
+                const oldMatch = text.match(/已选\s*\/\s*容量[:：]?\s*(\d+)\s*\/\s*(\d+)/);
+                if (oldMatch) {
+                    full = isFull(oldMatch[1], oldMatch[2]);
                 }
             }
             if (full) continue;
 
-            // Find Button
             const btns = card.querySelectorAll('button.el-button--primary');
             for (let b of btns) {
-                if (b.innerText.trim() === '选择') {
-                    return { btn: b, name: courseName, matchCount, totalVisible: cards.length };
+                if (normalizeText(b.innerText) === '选择' && !b.disabled) {
+                    return { btn: b, name: courseName, matchCount, totalVisible };
                 }
             }
         }
-        return { btn: null, matchCount, totalVisible: cards.length };
+
+        return { btn: null, matchCount, totalVisible };
+    }
+
+    // 2. Find Available Lesson Button
+    function findBestLesson() {
+        const tableResult = findBestLessonFromTable();
+        if (tableResult.totalVisible > 0) return tableResult;
+
+        return findBestLessonFromCards();
     }
 
     // 3. Handle Auto-Confirm Dialog
