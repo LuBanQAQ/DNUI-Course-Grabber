@@ -1,3 +1,4 @@
+最新版已发布 本项目不再维护 https://github.com/NeuShimmer/neusoft-course-grabber
 # 🚀 DNUI Course Grabber
 
 > 大连东软信息学院自动抢课脚本 —— 智能识别无冲突课程，定时抢课，快人一步！
