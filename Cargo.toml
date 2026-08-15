@@ -1,0 +1,23 @@
+[package]
+name = "xk-rust"
+version = "0.1.0"
+edition = "2024"
+description = "DNUI course selection desktop client rewritten in Rust"
+license = "MIT"
+
+[dependencies]
+aes = "0.8"
+anyhow = "1"
+base64 = "0.22"
+cipher = { version = "0.4", features = ["alloc", "block-padding"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossbeam-channel = "0.5"
+ddddocr = { git = "https://github.com/86maid/ddddocr.git", rev = "cc249cc4d79c6d609d808c540689f0187257a74f", default-features = true }
+ecb = "0.1"
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui_extras = "0.35"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+urlencoding = "2"

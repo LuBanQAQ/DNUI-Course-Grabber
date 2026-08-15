@@ -1,0 +1,5 @@
+/target
+/dist
+/xk-rust-prefs.json
+/xk-courses.json
+*.log
