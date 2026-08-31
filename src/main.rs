@@ -3,14 +3,23 @@
 mod api;
 mod app;
 mod model;
+mod network;
 mod ocr;
+mod vpn_auth;
 
 use app::XkApp;
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|arg| arg == "--vpn-auth-helper") {
+        vpn_auth::run_helper();
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("DNUI 选课工具（Rust） By Msz")
+            .with_title(format!(
+                "DNUI 选课工具 v{}（Rust） By Msz",
+                env!("CARGO_PKG_VERSION")
+            ))
             .with_inner_size([1_380.0, 820.0])
             .with_min_inner_size([980.0, 640.0]),
         ..Default::default()

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, thread, time::Duration};
+use std::{collections::HashMap, sync::Arc, thread, time::Duration};
 
 use aes::Aes128;
 use anyhow::{Context, Result, anyhow, bail};
@@ -8,12 +8,14 @@ use ecb::Encryptor;
 use regex::Regex;
 use reqwest::{
     blocking::{Client, Response},
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT},
+    cookie::Jar,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT},
 };
 use serde_json::{Value, json};
 
 use crate::{
     model::{Batch, Course},
+    network::{self, CheckedRequest, VpnRequired, build_client_with_jar, current_session_jar},
     ocr::recognize_captcha,
 };
 
@@ -25,6 +27,7 @@ type Aes128EcbEnc = Encryptor<Aes128>;
 #[derive(Clone)]
 pub struct ApiClient {
     client: Client,
+    cookie_jar: Arc<Jar>,
     host: String,
     api: String,
     profile: String,
@@ -39,6 +42,7 @@ pub struct LoginSession {
 
 fn json_response(response: Response, stage: &str) -> Result<Value> {
     let status = response.status();
+    let final_url = response.url().clone();
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
@@ -47,13 +51,97 @@ fn json_response(response: Response, stage: &str) -> Result<Value> {
         .to_owned();
     let text = response
         .text()
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("{stage}读取响应失败"))?;
-    serde_json::from_str(&text).map_err(|error| {
-        let excerpt: String = text.chars().take(240).collect();
-        anyhow!(
-            "{stage}未返回 JSON：HTTP {status}，Content-Type={content_type}，响应={excerpt:?}，{error}"
+    parse_api_body(&text, stage, status.as_u16(), &content_type, &final_url)
+}
+
+fn parse_api_body(
+    text: &str,
+    stage: &str,
+    status: u16,
+    content_type: &str,
+    final_url: &reqwest::Url,
+) -> Result<Value> {
+    if let Ok(body) = serde_json::from_str::<Value>(text)
+        && body.is_object()
+    {
+        return Ok(body);
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("vpn.neuedu.com") {
+        return Err(VpnRequired.into());
+    }
+    let (kind, guidance) = if final_url.path() == "/xsxk/profile/index.html"
+        || lower.contains("loginvue")
+        || lower.contains("loginform")
+        || (lower.contains("type=\"password\"") && text.contains("登录"))
+    {
+        (
+            "疑似登录页/会话失效",
+            "请关闭旧版和其他重复登录的程序，再重新登录并刷新课程；不要继续使用旧会话",
         )
-    })
+    } else if [
+        "请求过于频繁",
+        "操作频繁",
+        "访问频繁",
+        "安全校验",
+        "访问被拒绝",
+    ]
+    .iter()
+    .any(|s| text.contains(s))
+    {
+        (
+            "疑似频率限制/安全验证页面",
+            "请停止重复请求，并在官方网页查看提示；不要绕过验证或继续高速重试",
+        )
+    } else if lower.contains("whitelabel error page")
+        || lower.contains("<title>error")
+        || lower.contains("<title>404")
+        || lower.contains("<title>500")
+    {
+        (
+            "疑似服务器错误页",
+            "请核对官方网页能否正常操作；需要进一步核对选课接口响应",
+        )
+    } else if lower.contains("<html")
+        || lower.contains("<!doctype html")
+        || content_type.contains("text/html")
+    {
+        (
+            "未识别的 HTML 页面",
+            "目前无法判断是会话、网关还是接口错误，请提供这条脱敏诊断；不要继续重复提交",
+        )
+    } else {
+        (
+            "不是预期的 JSON 对象",
+            "接口响应不符合协议，请停止重复提交并提供这条脱敏诊断",
+        )
+    };
+    // Never include raw HTML, arbitrary titles, query parameters or URL secrets.
+    let host = if final_url.host_str() == Some("xk.neusoft.edu.cn") {
+        "xk.neusoft.edu.cn"
+    } else {
+        "其他站点"
+    };
+    let path = match final_url.path() {
+        "/xsxk/profile/index.html"
+        | "/xsxk/auth/captcha"
+        | "/xsxk/auth/login"
+        | "/xsxk/elective/user"
+        | "/xsxk/elective/grablessons"
+        | "/xsxk/elective/clazz/list"
+        | "/xsxk/elective/clazz/add"
+        | "/xsxk/elective/clazz/del"
+        | "/xsxk/web/now"
+        | "/xsxk/error"
+        | "/error" => final_url.path(),
+        _ => "/[其他路径已隐藏]",
+    };
+    bail!(
+        "{stage}响应异常：HTTP {status}；类型={kind}；最终地址={host}{path}；响应长度={} 字节。{guidance}。本次提交结果未确认，请先核对已选课程。",
+        text.len()
+    )
 }
 
 fn code(value: &Value) -> i64 {
@@ -85,16 +173,17 @@ fn encrypt_password(password: &str, key: &str) -> Result<String> {
 
 impl ApiClient {
     pub fn new() -> Result<Self> {
+        Self::with_jar(current_session_jar()?)
+    }
+
+    fn with_jar(cookie_jar: Arc<Jar>) -> Result<Self> {
         let host = DEFAULT_HOST.to_owned();
         let api = format!("{host}/xsxk");
         let profile = format!("{api}/profile");
-        let client = Client::builder()
-            .cookie_store(true)
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36")
-            .build()
-            .context("HTTP 客户端初始化失败")?;
+        let client = build_client_with_jar(cookie_jar.clone())?;
         Ok(Self {
             client,
+            cookie_jar,
             host,
             api,
             profile,
@@ -116,10 +205,7 @@ impl ApiClient {
         let api = Self::new()?;
         let profile_html = api
             .common(api.client.get(format!("{}/index.html", api.profile)))
-            .send()
-            .context("加载登录页失败")?
-            .error_for_status()
-            .context("登录页返回错误状态")?
+            .send_checked("登录页")?
             .text()
             .context("读取登录页失败")?;
         let key = Regex::new(r#"loginVue\.loginForm\.aesKey\s*=\s*\"([^\"]+)\""#)?
@@ -133,10 +219,7 @@ impl ApiClient {
         for attempt in 1..=retries.max(1) {
             let captcha = json_response(
                 api.common(api.client.post(format!("{}/auth/captcha", api.api)))
-                    .send()
-                    .context("请求验证码失败")?
-                    .error_for_status()
-                    .context("验证码接口返回错误状态")?,
+                    .send_checked("验证码接口")?,
                 "验证码接口",
             )?;
             if code(&captcha) != 200 {
@@ -162,10 +245,7 @@ impl ApiClient {
                 api.common(api.client.post(format!("{}/auth/login", api.api)))
                     .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .form(&form)
-                    .send()
-                    .context("登录请求失败")?
-                    .error_for_status()
-                    .context("登录接口返回错误状态")?,
+                    .send_checked("登录接口")?,
                 "登录接口",
             )?;
             if code(&login) == 200 {
@@ -217,6 +297,43 @@ impl ApiClient {
         bail!("登录失败：{last_error}")
     }
 
+    /// No credentials and no OCR: verify that this process can reach the actual
+    /// captcha API, not merely a browser's authenticated VPN portal.
+    pub fn check_network() -> Result<()> {
+        Self::new()?.check_current_network()
+    }
+
+    pub fn authorize_vpn() -> Result<()> {
+        let cookies = crate::vpn_auth::authorize()?;
+        let candidate = Self::with_jar(network::session_jar(&cookies)?)?;
+        candidate.check_current_network().map_err(|error| {
+            if error.is::<VpnRequired>() {
+                error.context("授权窗口已经返回，但桌面程序仍被 VPN 网关要求验证。该连接可能还依赖浏览器或应用级隧道；当前未标记为授权成功，请联系学校确认是否允许桌面客户端接入。")
+            } else {
+                error.context("授权后的接口检测未通过")
+            }
+        })?;
+        network::install_session(cookies)
+    }
+
+    fn check_current_network(&self) -> Result<()> {
+        let api = self;
+        let body = json_response(
+            api.common(api.client.post(format!("{}/auth/captcha", api.api)))
+                .send_checked("网络检测/验证码接口")?,
+            "网络检测/验证码接口",
+        )?;
+        if code(&body) != 200
+            || body
+                .pointer("/data/captcha")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            bail!("网络检测未通过：选课验证码接口未返回有效数据，请检查校园网/VPN后重试");
+        }
+        Ok(())
+    }
+
     pub fn bind_batch(&self, token: &str, batch_id: &str) -> Result<String> {
         let form = [("batchId", batch_id)];
         let body = json_response(
@@ -224,10 +341,7 @@ impl ApiClient {
                 .header(AUTHORIZATION, token)
                 .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .form(&form)
-                .send()
-                .context("进入所选轮次失败")?
-                .error_for_status()
-                .context("进入轮次接口返回错误状态")?,
+                .send_checked("进入轮次接口")?,
             "进入轮次接口",
         )?;
         if code(&body) != 200 {
@@ -241,17 +355,20 @@ impl ApiClient {
     }
 
     pub fn discover_teaching_class_type(&self, token: &str, batch_id: &str) -> Result<String> {
+        // A manually supplied Cookie header would hide the VPN cookies in the jar.
+        let auth_cookie = network::SessionCookie {
+            name: "Authorization".to_owned(),
+            value: token.to_owned(),
+            path: "/".to_owned(),
+        };
+        network::add_session_cookie(&self.cookie_jar, &auth_cookie)?;
         let html = self
             .common(self.client.get(format!(
                 "{}/elective/grablessons?batchId={batch_id}",
                 self.api
             )))
             .header(AUTHORIZATION, token)
-            .header(COOKIE, format!("Authorization={token}"))
-            .send()
-            .context("加载选课页面失败")?
-            .error_for_status()
-            .context("选课页面返回错误状态")?
+            .send_checked("选课页面")?
             .text()
             .context("读取选课页面失败")?;
         let captures = Regex::new(r#"(?s)grablessonsVue\.menuData\.menuList\s*=\s*(\[.*?\])\s*;"#)?
@@ -306,10 +423,7 @@ impl ApiClient {
                         format!("{}/elective/grablessons?batchId={batch_id}", self.api),
                     )
                     .json(&payload)
-                    .send()
-                    .with_context(|| format!("请求课程列表第 {page} 页失败"))?
-                    .error_for_status()
-                    .with_context(|| format!("课程列表第 {page} 页返回错误状态"))?,
+                    .send_checked(&format!("课程列表第 {page} 页"))?,
                     "课程列表接口",
                 )?;
                 if code(&response_body) == 200 {
@@ -358,10 +472,7 @@ impl ApiClient {
     pub fn heartbeat(&self, token: &str) -> Result<()> {
         self.common(self.client.post(format!("{}/web/now", self.api)))
             .header(AUTHORIZATION, token)
-            .send()
-            .context("保活请求失败")?
-            .error_for_status()
-            .context("保活接口返回错误状态")?;
+            .send_checked("保活接口")?;
         Ok(())
     }
 
@@ -376,6 +487,12 @@ impl ApiClient {
         form.insert("clazzType", teaching_class_type);
         let clazz_id = course.id();
         let secret = course.secret();
+        if clazz_id.trim().is_empty()
+            || secret.trim().is_empty()
+            || teaching_class_type.trim().is_empty()
+        {
+            bail!("课程编号、选课类型或 secretVal 缺失，未发送选课请求；请重新抓取课程");
+        }
         form.insert("clazzId", clazz_id.as_str());
         form.insert("secretVal", secret.as_str());
         let body = json_response(
@@ -388,10 +505,7 @@ impl ApiClient {
                     format!("{}/elective/grablessons?batchId={batch_id}", self.api),
                 )
                 .form(&form)
-                .send()
-                .context("提交选课请求失败")?
-                .error_for_status()
-                .context("选课接口返回错误状态")?,
+                .send_checked("选课接口")?,
             "选课接口",
         )?;
         Ok(body)
@@ -421,10 +535,7 @@ impl ApiClient {
                     format!("{}/elective/grablessons?batchId={batch_id}", self.api),
                 )
                 .form(&form)
-                .send()
-                .context("提交退课请求失败")?
-                .error_for_status()
-                .context("退课接口返回错误状态")?,
+                .send_checked("退课接口")?,
             "退课接口",
         )
     }
@@ -432,7 +543,101 @@ impl ApiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiClient, DEFAULT_AES_KEY, encrypt_password};
+    use super::{ApiClient, DEFAULT_AES_KEY, encrypt_password, parse_api_body};
+    use crate::model::Course;
+    use serde_json::json;
+
+    #[test]
+    fn html_login_page_is_identified_without_leaking_html_or_query() {
+        let url = reqwest::Url::parse(
+            "https://xk.neusoft.edu.cn/xsxk/profile/index.html?token=TEST_SECRET",
+        )
+        .unwrap();
+        let error = parse_api_body(
+            "<html><script>var loginVue = {}; var token='TEST_SECRET';</script></html>",
+            "选课接口",
+            200,
+            "text/html; charset=UTF-8",
+            &url,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("疑似登录页/会话失效"));
+        assert!(error.contains("/xsxk/profile/index.html"));
+        assert!(!error.contains("TEST_SECRET"));
+        assert!(!error.contains("<html>"));
+    }
+
+    #[test]
+    fn unknown_html_is_not_automatically_blamed_on_vpn() {
+        let url = reqwest::Url::parse("https://xk.neusoft.edu.cn/xsxk/elective/clazz/add").unwrap();
+        let error = parse_api_body(
+            "<html><title>TEST_SECRET</title></html>",
+            "选课接口",
+            200,
+            "text/html",
+            &url,
+        )
+        .err()
+        .unwrap();
+        assert!(!error.is::<crate::network::VpnRequired>());
+        let message = error.to_string();
+        assert!(message.contains("未识别的 HTML 页面"));
+        assert!(message.contains("结果未确认"));
+        assert!(!message.contains("TEST_SECRET"));
+    }
+
+    #[test]
+    fn response_diagnostics_distinguish_known_page_types() {
+        let url =
+            reqwest::Url::parse("https://xk.neusoft.edu.cn/error/TEST_SECRET?token=TEST_SECRET")
+                .unwrap();
+        for (body, expected) in [
+            ("<html>操作频繁</html>", "频率限制/安全验证"),
+            (
+                "<html><title>Whitelabel Error Page</title></html>",
+                "服务器错误页",
+            ),
+        ] {
+            let message = parse_api_body(body, "选课接口", 200, "text/html", &url)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(message.contains(expected));
+            assert!(!message.contains("TEST_SECRET"));
+        }
+    }
+
+    #[test]
+    fn json_response_requires_an_object_but_tolerates_mislabeled_mime_type() {
+        let url = reqwest::Url::parse("https://xk.neusoft.edu.cn/xsxk/elective/clazz/add").unwrap();
+        assert_eq!(
+            parse_api_body(
+                r#"{"code":200,"data":true}"#,
+                "选课接口",
+                200,
+                "text/html",
+                &url
+            )
+            .unwrap(),
+            json!({"code":200,"data":true})
+        );
+        assert!(parse_api_body("[]", "选课接口", 200, "application/json", &url).is_err());
+        assert!(parse_api_body("", "选课接口", 200, "text/html", &url).is_err());
+    }
+
+    #[test]
+    fn incomplete_course_is_rejected_before_network_submission() {
+        let api = ApiClient::new().unwrap();
+        let course = Course {
+            raw: json!({"JXBID":"dummy-course", "KCM":"dummy"}),
+        };
+        let error = api
+            .select_course("dummy-token", "dummy-batch", "XGKC", &course)
+            .unwrap_err();
+        assert!(error.to_string().contains("未发送选课请求"));
+    }
 
     #[test]
     fn password_encryption_matches_python_version() {
@@ -440,6 +645,16 @@ mod tests {
             encrypt_password("hello", DEFAULT_AES_KEY).unwrap(),
             "zTB/3Oiwdhio9uX5c1PYEA=="
         );
+    }
+
+    #[test]
+    #[ignore = "read-only live network probe; requires the XK service"]
+    fn live_network_probe_reports_access_or_vpn_requirement() {
+        match ApiClient::check_network() {
+            Ok(()) => println!("NETWORK_READY"),
+            Err(error) if error.is::<crate::network::VpnRequired>() => println!("VPN_REQUIRED"),
+            Err(error) => panic!("unexpected network result: {error:#}"),
+        }
     }
 
     #[test]
