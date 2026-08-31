@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 pub const VPN_PORTAL: &str = "https://vpn.neuedu.com";
 pub const XK_ORIGIN: &str = "https://xk.neusoft.edu.cn";
 pub const XK_LOGIN: &str = "https://xk.neusoft.edu.cn/xsxk/profile/index.html";
+pub const TEACH_ORIGIN: &str = "https://teach.neusoft.edu.cn";
+pub const TEACH_HOME: &str =
+    "https://teach.neusoft.edu.cn/jwapp/sys/homeapp/home/index.html?av=&contextPath=/jwapp#/";
 pub const VPN_GUIDANCE: &str = "选课网关要求本程序完成 VPN 验证（不代表 aTrust 没有连接）。\n如果普通浏览器能访问，请点击“VPN 浏览器授权”，在独立窗口完成学校认证，再点击窗口中的“完成授权并检测”。\n仅打开外部浏览器不会把认证状态传给本程序；校内也可直接连接校园网后重试。";
 
 // Only the dedicated authorization window supplies these host-scoped cookies.

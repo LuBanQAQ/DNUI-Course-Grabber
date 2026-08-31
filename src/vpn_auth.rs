@@ -2,9 +2,13 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::network::{SessionCookie, XK_LOGIN, XK_ORIGIN};
+use crate::{
+    model::ScheduleSnapshot,
+    network::{SessionCookie, TEACH_HOME, TEACH_ORIGIN, XK_LOGIN, XK_ORIGIN},
+};
 
 const CHANNEL_HELLO: &str = "DNUI_VPN_AUTH_V1\n";
+const SCHEDULE_CHANNEL_HELLO: &str = "DNUI_SCHEDULE_IMPORT_V1\n";
 const MAX_REPLY: u64 = 128 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -13,9 +17,21 @@ struct AuthReply {
     error: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct ScheduleReply {
+    schedule: Option<ScheduleSnapshot>,
+    error: Option<String>,
+}
+
 pub fn is_xk_page(address: &str) -> bool {
     reqwest::Url::parse(address).is_ok_and(|url| {
         url.origin().ascii_serialization() == XK_ORIGIN && url.path().starts_with("/xsxk/")
+    })
+}
+
+pub fn is_teach_page(address: &str) -> bool {
+    reqwest::Url::parse(address).is_ok_and(|url| {
+        url.origin().ascii_serialization() == TEACH_ORIGIN && url.path().starts_with("/jwapp/")
     })
 }
 
@@ -47,6 +63,23 @@ fn decode_reply(bytes: &[u8]) -> Result<Vec<SessionCookie>> {
         bail!(
             "{}",
             reply.error.unwrap_or_else(|| "VPN 授权已取消".to_owned())
+        )
+    }
+}
+
+fn decode_schedule_reply(bytes: &[u8]) -> Result<ScheduleSnapshot> {
+    if bytes.len() as u64 > MAX_REPLY {
+        bail!("课表导入返回数据过大");
+    }
+    let reply: ScheduleReply = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow::anyhow!("课表导入窗口未返回有效结果，请重试"))?;
+    if let Some(schedule) = reply.schedule {
+        schedule.validate()?;
+        Ok(schedule)
+    } else {
+        bail!(
+            "{}",
+            reply.error.unwrap_or_else(|| "课表导入已取消".to_owned())
         )
     }
 }
@@ -93,6 +126,52 @@ pub fn authorize() -> Result<Vec<SessionCookie>> {
     result
 }
 
+#[cfg(windows)]
+pub fn import_schedule() -> Result<ScheduleSnapshot> {
+    use std::{
+        io::{Read, Write},
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+    };
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut child = Command::new(std::env::current_exe().context("无法定位课表导入程序")?)
+        .arg("--schedule-helper")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("无法启动课表导入窗口")?;
+    let result = (|| {
+        child
+            .stdin
+            .take()
+            .context("无法打开课表导入通道")?
+            .write_all(SCHEDULE_CHANNEL_HELLO.as_bytes())
+            .context("无法初始化课表导入通道")?;
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .context("无法读取课表导入通道")?
+            .take(MAX_REPLY + 1)
+            .read_to_end(&mut bytes)
+            .context("读取课表导入结果失败")?;
+        decode_schedule_reply(&bytes)
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    result
+}
+
+#[cfg(not(windows))]
+pub fn import_schedule() -> Result<ScheduleSnapshot> {
+    bail!("当前平台暂不支持内置课表导入窗口，请使用 Windows WebView2")
+}
+
 #[cfg(not(windows))]
 pub fn authorize() -> Result<Vec<SessionCookie>> {
     bail!("当前平台暂不支持内置 VPN 授权窗口，请使用校园网或系统 VPN 隧道")
@@ -123,6 +202,35 @@ pub fn run_helper() {
     }
 }
 
+pub fn run_schedule_helper() {
+    use std::io::{Read, Write};
+    let mut hello = vec![0; SCHEDULE_CHANNEL_HELLO.len()];
+    if std::io::stdin().read_exact(&mut hello).is_err()
+        || hello != SCHEDULE_CHANNEL_HELLO.as_bytes()
+    {
+        return;
+    }
+    #[cfg(windows)]
+    let result = window::run_schedule();
+    #[cfg(not(windows))]
+    let result: Result<ScheduleSnapshot> = Err(anyhow::anyhow!(
+        "当前平台暂不支持内置课表导入窗口，请使用 Windows WebView2"
+    ));
+    let reply = match result {
+        Ok(schedule) => ScheduleReply {
+            schedule: Some(schedule),
+            error: None,
+        },
+        Err(error) => ScheduleReply {
+            schedule: None,
+            error: Some(error.to_string()),
+        },
+    };
+    if let Ok(bytes) = serde_json::to_vec(&reply) {
+        let _ = std::io::stdout().write_all(&bytes);
+    }
+}
+
 #[cfg(windows)]
 mod window {
     use super::*;
@@ -141,6 +249,7 @@ mod window {
 
     enum AuthEvent {
         Export,
+        ImportSchedule(String),
         Navigate(String),
         Loaded(String),
     }
@@ -149,7 +258,10 @@ mod window {
         view: Option<WebView>,
         window: Option<Window>,
         proxy: EventLoopProxy<AuthEvent>,
+        start_url: &'static str,
+        schedule_mode: bool,
         result: Option<Result<Vec<SessionCookie>>>,
+        schedule_result: Option<Result<ScheduleSnapshot>>,
     }
 
     impl ApplicationHandler<AuthEvent> for AuthWindow {
@@ -161,9 +273,11 @@ mod window {
                 let window = event_loop
                     .create_window(
                         Window::default_attributes()
-                            .with_title(
-                                "VPN 授权：请完成学校登录，返回选课页后点击“完成授权并检测”",
-                            )
+                            .with_title(if self.schedule_mode {
+                                "课表导入：请完成教务系统登录，打开“我的课表”后点击导入"
+                            } else {
+                                "VPN 授权：请完成学校登录，返回选课页后点击“完成授权并检测”"
+                            })
                             .with_inner_size(LogicalSize::new(1100.0, 800.0)),
                     )
                     .map_err(|_| anyhow::anyhow!("无法创建 VPN 授权窗口"))?;
@@ -180,7 +294,7 @@ mod window {
                     // Keep the browser's security defaults (including SmartScreen).
                     .with_additional_browser_args("")
                     .with_incognito(true)
-                    .with_url(XK_LOGIN)
+                    .with_url(self.start_url)
                     .with_initialization_script(include_str!("vpn_auth.js"))
                     .with_navigation_handler(|url| allowed_navigation(&url))
                     .with_new_window_req_handler(move |url, _| {
@@ -199,6 +313,13 @@ mod window {
                             && is_xk_page(&request.uri().to_string())
                         {
                             let _ = ipc_proxy.send_event(AuthEvent::Export);
+                        } else if let Some(payload) =
+                            request.body().strip_prefix("dnui-import-schedule:")
+                        {
+                            if is_teach_page(&request.uri().to_string()) {
+                                let _ = ipc_proxy
+                                    .send_event(AuthEvent::ImportSchedule(payload.to_owned()));
+                            }
                         }
                     })
                     .with_download_started_handler(|_, _| false)
@@ -236,6 +357,9 @@ mod window {
                     }
                 }
                 AuthEvent::Export => {
+                    if self.schedule_mode {
+                        return;
+                    }
                     if !view.url().is_ok_and(|url| is_xk_page(&url)) {
                         return;
                     }
@@ -271,6 +395,19 @@ mod window {
                     self.result = Some(result);
                     event_loop.exit();
                 }
+                AuthEvent::ImportSchedule(payload) => {
+                    if !self.schedule_mode || !view.url().is_ok_and(|url| is_teach_page(&url)) {
+                        return;
+                    }
+                    let result = (|| {
+                        let schedule: ScheduleSnapshot = serde_json::from_str(&payload)
+                            .map_err(|_| anyhow::anyhow!("课表数据格式无效，请重新导入"))?;
+                        schedule.validate()?;
+                        Ok(schedule)
+                    })();
+                    self.schedule_result = Some(result);
+                    event_loop.exit();
+                }
             }
         }
 
@@ -289,7 +426,10 @@ mod window {
             window: None,
             view: None,
             proxy: event_loop.create_proxy(),
+            start_url: XK_LOGIN,
+            schedule_mode: false,
             result: None,
+            schedule_result: None,
         };
         event_loop
             .run_app(&mut app)
@@ -297,6 +437,29 @@ mod window {
         app.result.unwrap_or_else(|| {
             Err(anyhow::anyhow!(
                 "VPN 授权已取消；请在授权窗口完成认证后点击“完成授权并检测”"
+            ))
+        })
+    }
+
+    pub(super) fn run_schedule() -> Result<ScheduleSnapshot> {
+        let event_loop = EventLoop::<AuthEvent>::with_user_event()
+            .build()
+            .map_err(|_| anyhow::anyhow!("无法启动课表导入窗口消息循环"))?;
+        let mut app = AuthWindow {
+            window: None,
+            view: None,
+            proxy: event_loop.create_proxy(),
+            start_url: TEACH_HOME,
+            schedule_mode: true,
+            result: None,
+            schedule_result: None,
+        };
+        event_loop
+            .run_app(&mut app)
+            .map_err(|_| anyhow::anyhow!("课表导入窗口异常退出"))?;
+        app.schedule_result.unwrap_or_else(|| {
+            Err(anyhow::anyhow!(
+                "课表导入已取消；请完成登录并打开“我的课表”后点击导入"
             ))
         })
     }
@@ -333,6 +496,21 @@ mod tests {
             "https://xk.neusoft.edu.cn.evil.test/xsxk/",
         ] {
             assert!(!is_xk_page(url));
+        }
+    }
+
+    #[test]
+    fn schedule_import_accepts_only_teach_pages() {
+        assert!(is_teach_page(
+            "https://teach.neusoft.edu.cn/jwapp/sys/homeapp/home/index.html"
+        ));
+        for url in [
+            "https://xk.neusoft.edu.cn/xsxk/profile/index.html",
+            "https://teach.neusoft.edu.cn/",
+            "http://teach.neusoft.edu.cn/jwapp/sys/kbapp/index.do",
+            "https://teach.neusoft.edu.cn.evil.test/jwapp/",
+        ] {
+            assert!(!is_teach_page(url));
         }
     }
 

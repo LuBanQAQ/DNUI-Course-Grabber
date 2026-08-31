@@ -14,6 +14,10 @@ fn main() -> eframe::Result<()> {
         vpn_auth::run_helper();
         return Ok(());
     }
+    if std::env::args().any(|arg| arg == "--schedule-helper") {
+        vpn_auth::run_schedule_helper();
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(format!(

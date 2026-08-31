@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::{
     api::{ApiClient, LoginSession},
-    model::{Batch, Course, Prefs},
+    model::{Batch, Course, Prefs, ScheduleEntry, ScheduleSnapshot},
     network::{VPN_GUIDANCE, VPN_PORTAL, VpnRequired},
 };
 
@@ -27,6 +27,7 @@ enum WorkerEvent {
     Status(String),
     NetworkReady,
     VpnAuthorized,
+    ScheduleImported(ScheduleSnapshot),
     VpnRequired {
         task_finished: bool,
         detail: Option<String>,
@@ -79,6 +80,11 @@ pub struct XkApp {
     total: usize,
     selected_courses: BTreeSet<usize>,
     filter: String,
+    major_period_filter: u8,
+    schedule: Vec<ScheduleEntry>,
+    schedule_filter_applied: bool,
+    schedule_conflict_indexes: BTreeSet<usize>,
+    schedule_filter_revision: u64,
     rob_running: bool,
     paused: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -137,6 +143,11 @@ impl XkApp {
             total: 0,
             selected_courses: BTreeSet::new(),
             filter: String::new(),
+            major_period_filter: 0,
+            schedule: Vec::new(),
+            schedule_filter_applied: false,
+            schedule_conflict_indexes: BTreeSet::new(),
+            schedule_filter_revision: 0,
             rob_running: false,
             paused: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
@@ -197,6 +208,92 @@ impl XkApp {
             };
             let _ = tx.send(event);
         });
+    }
+
+    fn import_schedule(&mut self) {
+        self.busy = true;
+        self.status = "请在独立窗口登录教务系统，打开“我的课表”后点击“导入当前课表”".to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || match crate::vpn_auth::import_schedule() {
+            Ok(snapshot) => {
+                let _ = tx.send(WorkerEvent::ScheduleImported(snapshot));
+            }
+            Err(error) => {
+                let _ = tx.send(WorkerEvent::Error(format!("课表导入失败：{error:#}")));
+            }
+        });
+    }
+
+    fn reset_schedule_filter(&mut self) {
+        self.schedule_filter_applied = false;
+        self.schedule_conflict_indexes.clear();
+        self.schedule_filter_revision = self.schedule_filter_revision.wrapping_add(1);
+    }
+
+    fn apply_schedule_filter(&mut self) {
+        if self.schedule.is_empty() {
+            self.reset_schedule_filter();
+            self.status = "请先导入我的课表，再应用课表筛选".to_owned();
+            return;
+        }
+        if self.courses.is_empty() {
+            self.reset_schedule_filter();
+            self.status = "请先抓取课程列表，再应用课表筛选".to_owned();
+            return;
+        }
+        // An explicit click means the user wants conflict exclusion enabled.
+        self.prefs.avoid_schedule_conflicts = true;
+        let (parseable_courses, conflicts) =
+            schedule_conflict_indexes(&self.courses, &self.schedule);
+        let conflict_count = conflicts.len();
+        let needle = self.filter.trim().to_lowercase();
+        let base_visible_count = self
+            .courses
+            .iter()
+            .filter(|course| self.matches_non_schedule_filters(course, &needle))
+            .count();
+        let visible_conflict_count = conflicts
+            .iter()
+            .filter(|index| {
+                self.courses
+                    .get(**index)
+                    .is_some_and(|course| self.matches_non_schedule_filters(course, &needle))
+            })
+            .count();
+        self.schedule_conflict_indexes = conflicts;
+        self.schedule_filter_applied = true;
+        self.schedule_filter_revision = self.schedule_filter_revision.wrapping_add(1);
+        self.status = if self.prefs.avoid_schedule_conflicts {
+            format!(
+                "课表筛选已应用：导入 {} 条，课程时间识别 {}/{} 门，排除 {} 门冲突课程；当前列表实际减少 {} 门（筛选前 {} 门）",
+                self.schedule.len(),
+                parseable_courses,
+                self.courses.len(),
+                conflict_count,
+                visible_conflict_count,
+                base_visible_count
+            )
+        } else {
+            format!(
+                "已计算课表冲突：识别 {}/{} 门课程，发现 {} 门冲突；当前列表涉及 {} 门，请勾选“排除课表冲突”后查看过滤结果",
+                parseable_courses,
+                self.courses.len(),
+                conflict_count,
+                visible_conflict_count
+            )
+        };
+    }
+
+    fn clear_schedule_filter(&mut self) {
+        self.reset_schedule_filter();
+        self.status = "已取消课表筛选，恢复冲突课程".to_owned();
+    }
+
+    fn matches_non_schedule_filters(&self, course: &Course, needle: &str) -> bool {
+        (!self.prefs.only_selectable || course.selectable() || course.enrolled())
+            && (self.major_period_filter == 0
+                || course.matches_major_period(self.major_period_filter))
+            && (needle.is_empty() || course.searchable_text().contains(needle))
     }
 
     fn choose_batch(&mut self) {
@@ -627,14 +724,33 @@ impl XkApp {
             .courses
             .iter()
             .enumerate()
-            .filter(|(_, course)| {
-                !self.prefs.only_selectable || course.selectable() || course.enrolled()
+            .filter(|(_, course)| self.matches_non_schedule_filters(course, &needle))
+            .filter(|(index, course)| {
+                !self.schedule_filter_applied
+                    || !self.prefs.avoid_schedule_conflicts
+                    || course.enrolled()
+                    || !self.schedule_conflict_indexes.contains(index)
             })
             .filter(|(_, course)| needle.is_empty() || course.searchable_text().contains(&needle))
             .map(|(index, _)| index)
             .collect();
 
+        ui.horizontal(|ui| {
+            ui.strong(format!(
+                "课程列表：显示 {} 门 / 共 {} 门",
+                visible.len(),
+                self.courses.len()
+            ));
+            if self.schedule_filter_applied {
+                ui.label(format!(
+                    "课表冲突索引：{} 门",
+                    self.schedule_conflict_indexes.len()
+                ));
+            }
+        });
+
         let table = TableBuilder::new(ui)
+            .id_salt(("course-table", self.schedule_filter_revision))
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -682,7 +798,11 @@ impl XkApp {
                     let status = if course.enrolled() {
                         "已选"
                     } else if course.selectable() {
-                        "可选"
+                        if self.schedule_conflict_indexes.contains(&index) {
+                            "课表冲突"
+                        } else {
+                            "可选"
+                        }
                     } else if course.has_conflict() {
                         "冲突"
                     } else {
@@ -735,6 +855,17 @@ impl XkApp {
                     self.status =
                         "VPN 授权成功：桌面程序已通过验证码接口检测，请重新登录并抓取课程"
                             .to_owned();
+                }
+                WorkerEvent::ScheduleImported(snapshot) => {
+                    self.busy = false;
+                    let count = snapshot.entries.len();
+                    self.schedule = snapshot.entries;
+                    self.reset_schedule_filter();
+                    self.status = if count == 0 {
+                        format!("课表已导入：{}，当前没有课程记录", snapshot.semester)
+                    } else {
+                        format!("课表已导入：{}，{} 条课程记录", snapshot.semester, count)
+                    };
                 }
                 WorkerEvent::NetworkReady => {
                     self.busy = false;
@@ -801,6 +932,7 @@ impl XkApp {
                     self.courses = courses;
                     self.total = total;
                     self.selected_courses.clear();
+                    self.reset_schedule_filter();
                     let output = app_file("xk-courses.json");
                     let values: Vec<&Value> =
                         self.courses.iter().map(|course| &course.raw).collect();
@@ -935,6 +1067,48 @@ impl eframe::App for XkApp {
                         {
                             self.check_network();
                         }
+                        if ui
+                            .add_enabled(
+                                !self.busy && !self.rob_running,
+                                egui::Button::new("导入我的课表"),
+                            )
+                            .clicked()
+                        {
+                            self.import_schedule();
+                        }
+                        if !self.schedule.is_empty() {
+                            let filter_label = if self.schedule_filter_applied {
+                                "取消课表筛选"
+                            } else {
+                                "按课表筛选"
+                            };
+                            if ui
+                                .add_enabled(
+                                    !self.busy && !self.rob_running && !self.courses.is_empty(),
+                                    egui::Button::new(filter_label),
+                                )
+                                .clicked()
+                            {
+                                if self.schedule_filter_applied {
+                                    self.clear_schedule_filter();
+                                } else {
+                                    self.apply_schedule_filter();
+                                }
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                        if !self.schedule.is_empty()
+                            && ui
+                                .add_enabled(
+                                    !self.busy && !self.rob_running,
+                                    egui::Button::new("清除课表"),
+                                )
+                                .clicked()
+                        {
+                            self.schedule.clear();
+                            self.reset_schedule_filter();
+                            self.status = "已清除课表筛选数据".to_owned();
+                        }
                     });
                     if self.vpn_required {
                         ui.colored_label(egui::Color32::from_rgb(160, 70, 0), VPN_GUIDANCE);
@@ -977,8 +1151,45 @@ impl eframe::App for XkApp {
                             ui.add_sized(
                                 [220.0, 30.0],
                                 egui::TextEdit::singleline(&mut self.filter)
-                                    .hint_text("课程号 / 课程名 / 教师"),
+                                    .hint_text("课程号 / 课程名 / 教师 / 星期 / 节次"),
                             );
+                            ui.end_row();
+                            ui.label("大节筛选");
+                            let major_period_text = if self.major_period_filter == 0 {
+                                "全部大节".to_owned()
+                            } else {
+                                format!("第{}大节", self.major_period_filter)
+                            };
+                            egui::ComboBox::from_id_salt("major-period-filter")
+                                .selected_text(major_period_text)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.major_period_filter,
+                                        0,
+                                        "全部大节",
+                                    );
+                                    for period in 1..=7 {
+                                        ui.selectable_value(
+                                            &mut self.major_period_filter,
+                                            period,
+                                            format!(
+                                                "第{period}大节（{}-{}节）",
+                                                period * 2 - 1,
+                                                period * 2
+                                            ),
+                                        );
+                                    }
+                                });
+                            ui.checkbox(&mut self.prefs.avoid_schedule_conflicts, "排除课表冲突");
+                            ui.label(if self.schedule.is_empty() {
+                                "课表未导入"
+                            } else if self.schedule_filter_applied {
+                                "课表筛选已应用"
+                            } else {
+                                "课表已导入，待筛选"
+                            });
+                            ui.label("");
+                            ui.label("");
                             ui.end_row();
                             ui.label("403罚时(ms)");
                             ui.add(
@@ -1183,6 +1394,23 @@ impl eframe::App for XkApp {
     }
 }
 
+fn schedule_conflict_indexes(
+    courses: &[Course],
+    schedule: &[ScheduleEntry],
+) -> (usize, BTreeSet<usize>) {
+    let mut parseable_courses = 0;
+    let mut conflicts = BTreeSet::new();
+    for (index, course) in courses.iter().enumerate() {
+        if !course.schedule_entries().is_empty() {
+            parseable_courses += 1;
+        }
+        if !course.enrolled() && course.schedule_conflict(schedule).is_some() {
+            conflicts.insert(index);
+        }
+    }
+    (parseable_courses, conflicts)
+}
+
 fn app_file(name: &str) -> PathBuf {
     let directory = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -1259,7 +1487,11 @@ fn display_names(names: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerEvent, selection_succeeded, stop_after_submission_error, wait_interval};
+    use super::{
+        WorkerEvent, schedule_conflict_indexes, selection_succeeded, stop_after_submission_error,
+        wait_interval,
+    };
+    use crate::model::{Course, ScheduleEntry, WeekRange};
     use crate::network::VpnRequired;
     use serde_json::json;
     use std::{sync::atomic::AtomicBool, time::Instant};
@@ -1314,5 +1546,38 @@ mod tests {
         assert!(stopped.load(std::sync::atomic::Ordering::Relaxed));
         assert!(message.contains("未继续重试"));
         assert!(message.contains("确认本次提交结果"));
+    }
+
+    #[test]
+    fn schedule_filter_reports_parseable_courses_and_conflicts() {
+        let courses = vec![
+            Course {
+                raw: json!({
+                    "KCM":"冲突课程",
+                    "SFKT":"1",
+                    "SKSJ":[{"SKXQ":"2","KSJC":"3","JSJC":"4","SKZCMC":"1-16周"}]
+                }),
+            },
+            Course {
+                raw: json!({"KCM":"无时间课程","SFKT":"1"}),
+            },
+            Course {
+                raw: json!({
+                    "KCM":"已选课程",
+                    "SFYX":"1",
+                    "SKSJ":[{"SKXQ":"2","KSJC":"3","JSJC":"4","SKZCMC":"1-16周"}]
+                }),
+            },
+        ];
+        let schedule = vec![ScheduleEntry {
+            name: "已有课程".to_owned(),
+            weekday: 2,
+            start_section: 3,
+            end_section: 4,
+            weeks: vec![WeekRange::new(1, 16, 0)],
+        }];
+        let (parseable, conflicts) = schedule_conflict_indexes(&courses, &schedule);
+        assert_eq!(parseable, 2);
+        assert_eq!(conflicts.into_iter().collect::<Vec<_>>(), vec![0]);
     }
 }
