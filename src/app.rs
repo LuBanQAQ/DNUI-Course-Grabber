@@ -19,11 +19,18 @@ use serde_json::Value;
 use crate::{
     api::{ApiClient, LoginSession},
     model::{Batch, Course, Prefs},
+    network::{VPN_GUIDANCE, VPN_PORTAL, VpnRequired},
 };
 
 #[allow(clippy::large_enum_variant)]
 enum WorkerEvent {
     Status(String),
+    NetworkReady,
+    VpnAuthorized,
+    VpnRequired {
+        task_finished: bool,
+        detail: Option<String>,
+    },
     LoginReady(LoginSession),
     Courses {
         session: LoginSession,
@@ -38,6 +45,19 @@ enum WorkerEvent {
         pending: Vec<String>,
     },
     Error(String),
+}
+
+impl WorkerEvent {
+    fn from_error(error: anyhow::Error) -> Self {
+        if error.is::<VpnRequired>() {
+            Self::VpnRequired {
+                task_finished: false,
+                detail: None,
+            }
+        } else {
+            Self::Error(format!("{error:#}"))
+        }
+    }
 }
 
 pub struct XkApp {
@@ -62,6 +82,7 @@ pub struct XkApp {
     paused: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     result_dialog: Option<String>,
+    vpn_required: bool,
 }
 
 impl XkApp {
@@ -119,6 +140,7 @@ impl XkApp {
             paused: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             result_dialog: None,
+            vpn_required: false,
         }
     }
 
@@ -137,15 +159,42 @@ impl XkApp {
         }
         self.save_prefs();
         self.busy = true;
-        self.status = "正在登录并使用 Rust ddddocr 识别验证码...".to_owned();
+        self.vpn_required = false;
+        self.status = "正在检查校园网/VPN并登录...".to_owned();
         let tx = self.tx.clone();
         thread::spawn(move || match ApiClient::login(&username, &password, 5) {
             Ok(session) => {
                 let _ = tx.send(WorkerEvent::LoginReady(session));
             }
             Err(error) => {
-                let _ = tx.send(WorkerEvent::Error(format!("{error:#}")));
+                let _ = tx.send(WorkerEvent::from_error(error));
             }
+        });
+    }
+
+    fn check_network(&mut self) {
+        self.busy = true;
+        self.status = "正在检测本程序能否访问选课接口...".to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let event = match ApiClient::check_network() {
+                Ok(()) => WorkerEvent::NetworkReady,
+                Err(error) => WorkerEvent::from_error(error),
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    fn authorize_vpn(&mut self) {
+        self.busy = true;
+        self.status = "请在独立授权窗口完成校园 VPN 认证，再点击“完成授权并检测”".to_owned();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let event = match ApiClient::authorize_vpn() {
+                Ok(()) => WorkerEvent::VpnAuthorized,
+                Err(error) => WorkerEvent::from_error(error),
+            };
+            let _ = tx.send(event);
         });
     }
 
@@ -191,7 +240,7 @@ impl XkApp {
                     retries,
                     penalty_ms,
                 )?;
-                if let Ok((mut enrolled, _)) = session.api.fetch_courses(
+                match session.api.fetch_courses(
                     &session.token,
                     &batch.code,
                     "YXKC",
@@ -201,15 +250,19 @@ impl XkApp {
                     retries,
                     penalty_ms,
                 ) {
-                    for course in &mut enrolled {
-                        course.raw["_enrolled"] = Value::Bool(true);
+                    Ok((mut enrolled, _)) => {
+                        for course in &mut enrolled {
+                            course.raw["_enrolled"] = Value::Bool(true);
+                        }
+                        let existing: BTreeSet<String> = courses.iter().map(Course::id).collect();
+                        courses.extend(
+                            enrolled
+                                .into_iter()
+                                .filter(|course| !existing.contains(&course.id())),
+                        );
                     }
-                    let existing: BTreeSet<String> = courses.iter().map(Course::id).collect();
-                    courses.extend(
-                        enrolled
-                            .into_iter()
-                            .filter(|course| !existing.contains(&course.id())),
-                    );
+                    Err(error) if error.is::<VpnRequired>() => return Err(error),
+                    Err(_) => {}
                 }
                 anyhow::Ok((class_type, campus, courses, total))
             })();
@@ -225,7 +278,7 @@ impl XkApp {
                     });
                 }
                 Err(error) => {
-                    let _ = tx.send(WorkerEvent::Error(format!("{error:#}")));
+                    let _ = tx.send(WorkerEvent::from_error(error));
                 }
             }
         });
@@ -263,18 +316,23 @@ impl XkApp {
         let tx = self.tx.clone();
         thread::spawn(move || {
             let heartbeat_finished = Arc::new(AtomicBool::new(false));
-            if keep_alive {
+            let heartbeat = if keep_alive {
                 let heartbeat_session = session.clone();
                 let heartbeat_stopped = stopped.clone();
                 let heartbeat_finished = heartbeat_finished.clone();
                 let heartbeat_tx = tx.clone();
-                thread::spawn(move || {
+                Some(thread::spawn(move || {
                     while !heartbeat_stopped.load(Ordering::Relaxed)
                         && !heartbeat_finished.load(Ordering::Relaxed)
                     {
                         let status = match heartbeat_session.api.heartbeat(&heartbeat_session.token)
                         {
                             Ok(()) => "保活成功".to_owned(),
+                            Err(error) if error.is::<VpnRequired>() => {
+                                heartbeat_stopped.store(true, Ordering::Relaxed);
+                                let _ = heartbeat_tx.send(WorkerEvent::from_error(error));
+                                return;
+                            }
                             Err(error) => format!("保活失败：{error:#}"),
                         };
                         let _ = heartbeat_tx.send(WorkerEvent::Status(status));
@@ -287,13 +345,18 @@ impl XkApp {
                             thread::sleep(Duration::from_millis(100));
                         }
                     }
-                });
-            }
+                }))
+            } else {
+                None
+            };
             if !schedule.is_empty() {
                 match wait_until(&schedule, &stopped, &tx) {
                     Ok(()) => {}
                     Err(error) => {
                         heartbeat_finished.store(true, Ordering::Relaxed);
+                        if let Some(heartbeat) = heartbeat {
+                            let _ = heartbeat.join();
+                        }
                         let _ = tx.send(WorkerEvent::Error(error));
                         return;
                     }
@@ -320,6 +383,10 @@ impl XkApp {
                     while paused.load(Ordering::Relaxed) && !stopped.load(Ordering::Relaxed) {
                         thread::sleep(Duration::from_millis(100));
                     }
+                    if stopped.load(Ordering::Relaxed) {
+                        next.push(course);
+                        continue;
+                    }
                     let name = course.name();
                     match session.api.select_course(
                         &session.token,
@@ -340,17 +407,25 @@ impl XkApp {
                             }
                         }
                         Err(error) => {
-                            let _ = tx.send(WorkerEvent::Status(format!(
-                                "轮次 {round}/{click_times} | {name}: {error}"
-                            )));
+                            if error.is::<VpnRequired>() {
+                                stopped.store(true, Ordering::Relaxed);
+                                let _ = tx.send(WorkerEvent::from_error(error));
+                            } else {
+                                let _ = tx.send(WorkerEvent::Status(format!(
+                                    "轮次 {round}/{click_times} | {name}: {error}"
+                                )));
+                            }
                             next.push(course);
                         }
                     }
-                    thread::sleep(Duration::from_millis(click_interval));
+                    wait_interval(click_interval, &stopped);
                 }
                 pending = next;
             }
             heartbeat_finished.store(true, Ordering::Relaxed);
+            if let Some(heartbeat) = heartbeat {
+                let _ = heartbeat.join();
+            }
             let pending_names = pending.iter().map(Course::name).collect();
             let _ = tx.send(WorkerEvent::RobFinished {
                 successful,
@@ -407,13 +482,26 @@ impl XkApp {
                     retries,
                     penalty_ms,
                 );
-                let Ok((courses, _)) = fresh else {
-                    let _ = tx.send(WorkerEvent::Status(format!(
-                        "换课轮次 {round}/{rounds}：刷新课程失败"
-                    )));
-                    thread::sleep(Duration::from_millis(interval.max(500)));
-                    continue;
+                let (courses, _) = match fresh {
+                    Ok(courses) => courses,
+                    Err(error) if error.is::<VpnRequired>() => {
+                        let _ = tx.send(WorkerEvent::VpnRequired {
+                            task_finished: true,
+                            detail: Some("VPN 验证失效，换课已停止；尚未提交退课请求。".to_owned()),
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = tx.send(WorkerEvent::Status(format!(
+                            "换课轮次 {round}/{rounds}：刷新课程失败：{error:#}"
+                        )));
+                        wait_interval(interval.max(500), &stopped);
+                        continue;
+                    }
                 };
+                if stopped.load(Ordering::Relaxed) {
+                    break;
+                }
                 let Some(fresh_target) = courses
                     .into_iter()
                     .find(|course| course.id() == target.id())
@@ -430,7 +518,7 @@ impl XkApp {
                         target.name(),
                         current.name()
                     )));
-                    thread::sleep(Duration::from_millis(interval.max(500)));
+                    wait_interval(interval.max(500), &stopped);
                     continue;
                 }
                 let _ = tx.send(WorkerEvent::Status(format!(
@@ -452,6 +540,16 @@ impl XkApp {
                         return;
                     }
                     Err(error) => {
+                        if error.is::<VpnRequired>() {
+                            let _ = tx.send(WorkerEvent::VpnRequired {
+                                task_finished: true,
+                                detail: Some(format!(
+                                    "退选 {} 时 VPN 验证失效，未继续选 B。请连接后检查 A、B 的实际选课状态。",
+                                    current.name()
+                                )),
+                            });
+                            return;
+                        }
                         let _ = tx.send(WorkerEvent::Error(format!(
                             "退选 {} 失败：{error:#}",
                             current.name()
@@ -473,6 +571,13 @@ impl XkApp {
                         });
                         return;
                     }
+                    Err(error) if error.is::<VpnRequired>() => {
+                        let _ = tx.send(WorkerEvent::VpnRequired {
+                            task_finished: true,
+                            detail: Some("退 A 后选 B 时 VPN 验证失效，无法确认 B 或自动回选 A。请立即连接 VPN，并在选课系统核对 A、B 状态。".to_owned()),
+                        });
+                        return;
+                    }
                     result => {
                         let reason = match result {
                             Ok(body) => response_message(&body),
@@ -487,6 +592,13 @@ impl XkApp {
                         let rollback_text = match rollback {
                             Ok(body) if response_accepted(&body) => "已尝试回选 A".to_owned(),
                             Ok(body) => format!("回选 A 失败：{}", response_message(&body)),
+                            Err(error) if error.is::<VpnRequired>() => {
+                                let _ = tx.send(WorkerEvent::VpnRequired {
+                                    task_finished: true,
+                                    detail: Some(format!("B 选课失败：{reason}；回选 A 时 VPN 验证失效。请立即连接 VPN，并在选课系统核对 A、B 状态。")),
+                                });
+                                return;
+                            }
                             Err(error) => format!("回选 A 失败：{error:#}"),
                         };
                         let _ = tx.send(WorkerEvent::Error(format!(
@@ -612,7 +724,45 @@ impl XkApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                WorkerEvent::Status(status) => self.status = status,
+                WorkerEvent::VpnAuthorized => {
+                    self.busy = false;
+                    self.vpn_required = false;
+                    self.login_session = None;
+                    self.batch_dialog = false;
+                    self.current_batch = None;
+                    self.status =
+                        "VPN 授权成功：桌面程序已通过验证码接口检测，请重新登录并抓取课程"
+                            .to_owned();
+                }
+                WorkerEvent::NetworkReady => {
+                    self.busy = false;
+                    self.vpn_required = false;
+                    self.status =
+                        "网络检测通过：本程序已能访问选课验证码接口，请点击登录".to_owned();
+                }
+                WorkerEvent::VpnRequired {
+                    task_finished,
+                    detail,
+                } => {
+                    self.busy = false;
+                    self.stopped.store(true, Ordering::Relaxed);
+                    self.paused.store(false, Ordering::Relaxed);
+                    self.vpn_required = true;
+                    self.login_session = None;
+                    self.batch_dialog = false;
+                    if task_finished {
+                        self.rob_running = false;
+                    }
+                    if let Some(detail) = detail {
+                        self.result_dialog = Some(detail);
+                    }
+                    self.status = "需要连接校园网或完成校园 VPN 验证".to_owned();
+                }
+                WorkerEvent::Status(status) => {
+                    if !self.vpn_required {
+                        self.status = status;
+                    }
+                }
                 WorkerEvent::LoginReady(session) => {
                     self.busy = false;
                     self.batches = session.batches.clone();
@@ -622,6 +772,7 @@ impl XkApp {
                         .position(|batch| batch.can_select == "1")
                         .unwrap_or(0);
                     self.login_session = Some(session);
+                    self.vpn_required = false;
                     self.batch_dialog = true;
                     self.status = "登录成功，请选择课程轮次".to_owned();
                 }
@@ -660,9 +811,16 @@ impl XkApp {
                     pending,
                 } => {
                     self.rob_running = false;
-                    self.status = "抢课任务结束".to_owned();
+                    if !self.vpn_required {
+                        self.status = "抢课任务结束".to_owned();
+                    }
                     self.result_dialog = Some(format!(
-                        "成功：{}\n未成功：{}",
+                        "{}成功：{}\n未成功：{}",
+                        if self.vpn_required {
+                            "VPN 验证失效，任务已停止；重新连接后请核对选课状态。\n"
+                        } else {
+                            ""
+                        },
                         display_names(&successful),
                         display_names(&pending)
                     ));
@@ -670,7 +828,9 @@ impl XkApp {
                 WorkerEvent::Error(error) => {
                     self.busy = false;
                     self.rob_running = false;
-                    self.status = "执行失败".to_owned();
+                    if !self.vpn_required {
+                        self.status = "执行失败".to_owned();
+                    }
                     self.result_dialog = Some(error);
                 }
             }
@@ -734,6 +894,34 @@ impl eframe::App for XkApp {
                         ui.label("登录、课程抓取与抢课任务");
                     });
                     ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.busy && !self.rob_running,
+                                egui::Button::new("VPN 浏览器授权"),
+                            )
+                            .clicked()
+                        {
+                            self.authorize_vpn();
+                        }
+                        ui.hyperlink_to("打开校园 VPN（校外先连接）", VPN_PORTAL);
+                        if ui
+                            .add_enabled(
+                                !self.busy && !self.rob_running,
+                                egui::Button::new(if self.vpn_required {
+                                    "重新检测网络"
+                                } else {
+                                    "检测校园网/VPN"
+                                }),
+                            )
+                            .clicked()
+                        {
+                            self.check_network();
+                        }
+                    });
+                    if self.vpn_required {
+                        ui.colored_label(egui::Color32::from_rgb(160, 70, 0), VPN_GUIDANCE);
+                    }
                     egui::Grid::new("login-grid")
                         .num_columns(6)
                         .spacing([12.0, 9.0])
@@ -981,7 +1169,7 @@ impl eframe::App for XkApp {
 fn app_file(name: &str) -> PathBuf {
     let directory = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir())
+        .unwrap_or_else(std::env::temp_dir)
         .join("DNUI-XK");
     let _ = fs::create_dir_all(&directory);
     directory.join(name)
@@ -1005,6 +1193,14 @@ fn configure_chinese_font(ctx: &egui::Context) {
             ctx.set_fonts(fonts);
             break;
         }
+    }
+}
+
+fn wait_interval(milliseconds: u64, stopped: &AtomicBool) {
+    let duration = Duration::from_millis(milliseconds);
+    let start = Instant::now();
+    while start.elapsed() < duration && !stopped.load(Ordering::Relaxed) {
+        thread::sleep((duration - start.elapsed().min(duration)).min(Duration::from_millis(100)));
     }
 }
 
@@ -1046,8 +1242,10 @@ fn display_names(names: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::selection_succeeded;
+    use super::{WorkerEvent, selection_succeeded, wait_interval};
+    use crate::network::VpnRequired;
     use serde_json::json;
+    use std::{sync::atomic::AtomicBool, time::Instant};
 
     #[test]
     fn http_success_code_does_not_hide_business_failure() {
@@ -1065,5 +1263,28 @@ mod tests {
             "code": 200,
             "msg": "选课成功"
         })));
+    }
+
+    #[test]
+    fn vpn_error_survives_context_and_reaches_connection_guide() {
+        let error = anyhow::Error::new(VpnRequired).context("验证码请求失败");
+        assert!(matches!(
+            WorkerEvent::from_error(error),
+            WorkerEvent::VpnRequired {
+                task_finished: false,
+                detail: None
+            }
+        ));
+        assert!(matches!(
+            WorkerEvent::from_error(anyhow::anyhow!("HTTP 401")),
+            WorkerEvent::Error(_)
+        ));
+    }
+
+    #[test]
+    fn stopped_task_does_not_wait_for_retry_interval() {
+        let start = Instant::now();
+        wait_interval(60_000, &AtomicBool::new(true));
+        assert!(start.elapsed().as_secs() < 1);
     }
 }

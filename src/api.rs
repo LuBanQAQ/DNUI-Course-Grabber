@@ -1,4 +1,4 @@
-use std::{collections::HashMap, thread, time::Duration};
+use std::{collections::HashMap, sync::Arc, thread, time::Duration};
 
 use aes::Aes128;
 use anyhow::{Context, Result, anyhow, bail};
@@ -8,12 +8,14 @@ use ecb::Encryptor;
 use regex::Regex;
 use reqwest::{
     blocking::{Client, Response},
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT},
+    cookie::Jar,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT},
 };
 use serde_json::{Value, json};
 
 use crate::{
     model::{Batch, Course},
+    network::{self, CheckedRequest, VpnRequired, build_client_with_jar, current_session_jar},
     ocr::recognize_captcha,
 };
 
@@ -25,6 +27,7 @@ type Aes128EcbEnc = Encryptor<Aes128>;
 #[derive(Clone)]
 pub struct ApiClient {
     client: Client,
+    cookie_jar: Arc<Jar>,
     host: String,
     api: String,
     profile: String,
@@ -49,9 +52,11 @@ fn json_response(response: Response, stage: &str) -> Result<Value> {
         .text()
         .with_context(|| format!("{stage}读取响应失败"))?;
     serde_json::from_str(&text).map_err(|error| {
-        let excerpt: String = text.chars().take(240).collect();
+        if text.contains("vpn.neuedu.com") {
+            return VpnRequired.into();
+        }
         anyhow!(
-            "{stage}未返回 JSON：HTTP {status}，Content-Type={content_type}，响应={excerpt:?}，{error}"
+            "{stage}未返回 JSON：HTTP {status}，Content-Type={content_type}，{error}；请检查校园网/VPN连接"
         )
     })
 }
@@ -85,16 +90,17 @@ fn encrypt_password(password: &str, key: &str) -> Result<String> {
 
 impl ApiClient {
     pub fn new() -> Result<Self> {
+        Self::with_jar(current_session_jar()?)
+    }
+
+    fn with_jar(cookie_jar: Arc<Jar>) -> Result<Self> {
         let host = DEFAULT_HOST.to_owned();
         let api = format!("{host}/xsxk");
         let profile = format!("{api}/profile");
-        let client = Client::builder()
-            .cookie_store(true)
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36")
-            .build()
-            .context("HTTP 客户端初始化失败")?;
+        let client = build_client_with_jar(cookie_jar.clone())?;
         Ok(Self {
             client,
+            cookie_jar,
             host,
             api,
             profile,
@@ -116,10 +122,7 @@ impl ApiClient {
         let api = Self::new()?;
         let profile_html = api
             .common(api.client.get(format!("{}/index.html", api.profile)))
-            .send()
-            .context("加载登录页失败")?
-            .error_for_status()
-            .context("登录页返回错误状态")?
+            .send_checked("登录页")?
             .text()
             .context("读取登录页失败")?;
         let key = Regex::new(r#"loginVue\.loginForm\.aesKey\s*=\s*\"([^\"]+)\""#)?
@@ -133,10 +136,7 @@ impl ApiClient {
         for attempt in 1..=retries.max(1) {
             let captcha = json_response(
                 api.common(api.client.post(format!("{}/auth/captcha", api.api)))
-                    .send()
-                    .context("请求验证码失败")?
-                    .error_for_status()
-                    .context("验证码接口返回错误状态")?,
+                    .send_checked("验证码接口")?,
                 "验证码接口",
             )?;
             if code(&captcha) != 200 {
@@ -162,10 +162,7 @@ impl ApiClient {
                 api.common(api.client.post(format!("{}/auth/login", api.api)))
                     .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                     .form(&form)
-                    .send()
-                    .context("登录请求失败")?
-                    .error_for_status()
-                    .context("登录接口返回错误状态")?,
+                    .send_checked("登录接口")?,
                 "登录接口",
             )?;
             if code(&login) == 200 {
@@ -217,6 +214,43 @@ impl ApiClient {
         bail!("登录失败：{last_error}")
     }
 
+    /// No credentials and no OCR: verify that this process can reach the actual
+    /// captcha API, not merely a browser's authenticated VPN portal.
+    pub fn check_network() -> Result<()> {
+        Self::new()?.check_current_network()
+    }
+
+    pub fn authorize_vpn() -> Result<()> {
+        let cookies = crate::vpn_auth::authorize()?;
+        let candidate = Self::with_jar(network::session_jar(&cookies)?)?;
+        candidate.check_current_network().map_err(|error| {
+            if error.is::<VpnRequired>() {
+                anyhow!("授权窗口已经返回，但桌面程序仍被 VPN 网关要求验证。该连接可能还依赖浏览器或应用级隧道；当前未标记为授权成功，请联系学校确认是否允许桌面客户端接入。")
+            } else {
+                error.context("授权后的接口检测未通过")
+            }
+        })?;
+        network::install_session(cookies)
+    }
+
+    fn check_current_network(&self) -> Result<()> {
+        let api = self;
+        let body = json_response(
+            api.common(api.client.post(format!("{}/auth/captcha", api.api)))
+                .send_checked("网络检测/验证码接口")?,
+            "网络检测/验证码接口",
+        )?;
+        if code(&body) != 200
+            || body
+                .pointer("/data/captcha")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            bail!("网络检测未通过：选课验证码接口未返回有效数据，请检查校园网/VPN后重试");
+        }
+        Ok(())
+    }
+
     pub fn bind_batch(&self, token: &str, batch_id: &str) -> Result<String> {
         let form = [("batchId", batch_id)];
         let body = json_response(
@@ -224,10 +258,7 @@ impl ApiClient {
                 .header(AUTHORIZATION, token)
                 .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .form(&form)
-                .send()
-                .context("进入所选轮次失败")?
-                .error_for_status()
-                .context("进入轮次接口返回错误状态")?,
+                .send_checked("进入轮次接口")?,
             "进入轮次接口",
         )?;
         if code(&body) != 200 {
@@ -241,17 +272,20 @@ impl ApiClient {
     }
 
     pub fn discover_teaching_class_type(&self, token: &str, batch_id: &str) -> Result<String> {
+        // A manually supplied Cookie header would hide the VPN cookies in the jar.
+        let auth_cookie = network::SessionCookie {
+            name: "Authorization".to_owned(),
+            value: token.to_owned(),
+            path: "/".to_owned(),
+        };
+        network::add_session_cookie(&self.cookie_jar, &auth_cookie)?;
         let html = self
             .common(self.client.get(format!(
                 "{}/elective/grablessons?batchId={batch_id}",
                 self.api
             )))
             .header(AUTHORIZATION, token)
-            .header(COOKIE, format!("Authorization={token}"))
-            .send()
-            .context("加载选课页面失败")?
-            .error_for_status()
-            .context("选课页面返回错误状态")?
+            .send_checked("选课页面")?
             .text()
             .context("读取选课页面失败")?;
         let captures = Regex::new(r#"(?s)grablessonsVue\.menuData\.menuList\s*=\s*(\[.*?\])\s*;"#)?
@@ -306,10 +340,7 @@ impl ApiClient {
                         format!("{}/elective/grablessons?batchId={batch_id}", self.api),
                     )
                     .json(&payload)
-                    .send()
-                    .with_context(|| format!("请求课程列表第 {page} 页失败"))?
-                    .error_for_status()
-                    .with_context(|| format!("课程列表第 {page} 页返回错误状态"))?,
+                    .send_checked(&format!("课程列表第 {page} 页"))?,
                     "课程列表接口",
                 )?;
                 if code(&response_body) == 200 {
@@ -358,10 +389,7 @@ impl ApiClient {
     pub fn heartbeat(&self, token: &str) -> Result<()> {
         self.common(self.client.post(format!("{}/web/now", self.api)))
             .header(AUTHORIZATION, token)
-            .send()
-            .context("保活请求失败")?
-            .error_for_status()
-            .context("保活接口返回错误状态")?;
+            .send_checked("保活接口")?;
         Ok(())
     }
 
@@ -388,10 +416,7 @@ impl ApiClient {
                     format!("{}/elective/grablessons?batchId={batch_id}", self.api),
                 )
                 .form(&form)
-                .send()
-                .context("提交选课请求失败")?
-                .error_for_status()
-                .context("选课接口返回错误状态")?,
+                .send_checked("选课接口")?,
             "选课接口",
         )?;
         Ok(body)
@@ -421,10 +446,7 @@ impl ApiClient {
                     format!("{}/elective/grablessons?batchId={batch_id}", self.api),
                 )
                 .form(&form)
-                .send()
-                .context("提交退课请求失败")?
-                .error_for_status()
-                .context("退课接口返回错误状态")?,
+                .send_checked("退课接口")?,
             "退课接口",
         )
     }
@@ -440,6 +462,16 @@ mod tests {
             encrypt_password("hello", DEFAULT_AES_KEY).unwrap(),
             "zTB/3Oiwdhio9uX5c1PYEA=="
         );
+    }
+
+    #[test]
+    #[ignore = "read-only live network probe; requires the XK service"]
+    fn live_network_probe_reports_access_or_vpn_requirement() {
+        match ApiClient::check_network() {
+            Ok(()) => println!("NETWORK_READY"),
+            Err(error) if error.is::<crate::network::VpnRequired>() => println!("VPN_REQUIRED"),
+            Err(error) => panic!("unexpected network result: {error:#}"),
+        }
     }
 
     #[test]
