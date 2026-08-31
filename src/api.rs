@@ -42,6 +42,7 @@ pub struct LoginSession {
 
 fn json_response(response: Response, stage: &str) -> Result<Value> {
     let status = response.status();
+    let final_url = response.url().clone();
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
@@ -50,15 +51,97 @@ fn json_response(response: Response, stage: &str) -> Result<Value> {
         .to_owned();
     let text = response
         .text()
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("{stage}读取响应失败"))?;
-    serde_json::from_str(&text).map_err(|error| {
-        if text.contains("vpn.neuedu.com") {
-            return VpnRequired.into();
-        }
-        anyhow!(
-            "{stage}未返回 JSON：HTTP {status}，Content-Type={content_type}，{error}；请检查校园网/VPN连接"
+    parse_api_body(&text, stage, status.as_u16(), &content_type, &final_url)
+}
+
+fn parse_api_body(
+    text: &str,
+    stage: &str,
+    status: u16,
+    content_type: &str,
+    final_url: &reqwest::Url,
+) -> Result<Value> {
+    if let Ok(body) = serde_json::from_str::<Value>(text)
+        && body.is_object()
+    {
+        return Ok(body);
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("vpn.neuedu.com") {
+        return Err(VpnRequired.into());
+    }
+    let (kind, guidance) = if final_url.path() == "/xsxk/profile/index.html"
+        || lower.contains("loginvue")
+        || lower.contains("loginform")
+        || (lower.contains("type=\"password\"") && text.contains("登录"))
+    {
+        (
+            "疑似登录页/会话失效",
+            "请关闭旧版和其他重复登录的程序，再重新登录并刷新课程；不要继续使用旧会话",
         )
-    })
+    } else if [
+        "请求过于频繁",
+        "操作频繁",
+        "访问频繁",
+        "安全校验",
+        "访问被拒绝",
+    ]
+    .iter()
+    .any(|s| text.contains(s))
+    {
+        (
+            "疑似频率限制/安全验证页面",
+            "请停止重复请求，并在官方网页查看提示；不要绕过验证或继续高速重试",
+        )
+    } else if lower.contains("whitelabel error page")
+        || lower.contains("<title>error")
+        || lower.contains("<title>404")
+        || lower.contains("<title>500")
+    {
+        (
+            "疑似服务器错误页",
+            "请核对官方网页能否正常操作；需要进一步核对选课接口响应",
+        )
+    } else if lower.contains("<html")
+        || lower.contains("<!doctype html")
+        || content_type.contains("text/html")
+    {
+        (
+            "未识别的 HTML 页面",
+            "目前无法判断是会话、网关还是接口错误，请提供这条脱敏诊断；不要继续重复提交",
+        )
+    } else {
+        (
+            "不是预期的 JSON 对象",
+            "接口响应不符合协议，请停止重复提交并提供这条脱敏诊断",
+        )
+    };
+    // Never include raw HTML, arbitrary titles, query parameters or URL secrets.
+    let host = if final_url.host_str() == Some("xk.neusoft.edu.cn") {
+        "xk.neusoft.edu.cn"
+    } else {
+        "其他站点"
+    };
+    let path = match final_url.path() {
+        "/xsxk/profile/index.html"
+        | "/xsxk/auth/captcha"
+        | "/xsxk/auth/login"
+        | "/xsxk/elective/user"
+        | "/xsxk/elective/grablessons"
+        | "/xsxk/elective/clazz/list"
+        | "/xsxk/elective/clazz/add"
+        | "/xsxk/elective/clazz/del"
+        | "/xsxk/web/now"
+        | "/xsxk/error"
+        | "/error" => final_url.path(),
+        _ => "/[其他路径已隐藏]",
+    };
+    bail!(
+        "{stage}响应异常：HTTP {status}；类型={kind}；最终地址={host}{path}；响应长度={} 字节。{guidance}。本次提交结果未确认，请先核对已选课程。",
+        text.len()
+    )
 }
 
 fn code(value: &Value) -> i64 {
@@ -225,7 +308,7 @@ impl ApiClient {
         let candidate = Self::with_jar(network::session_jar(&cookies)?)?;
         candidate.check_current_network().map_err(|error| {
             if error.is::<VpnRequired>() {
-                anyhow!("授权窗口已经返回，但桌面程序仍被 VPN 网关要求验证。该连接可能还依赖浏览器或应用级隧道；当前未标记为授权成功，请联系学校确认是否允许桌面客户端接入。")
+                error.context("授权窗口已经返回，但桌面程序仍被 VPN 网关要求验证。该连接可能还依赖浏览器或应用级隧道；当前未标记为授权成功，请联系学校确认是否允许桌面客户端接入。")
             } else {
                 error.context("授权后的接口检测未通过")
             }
@@ -404,6 +487,12 @@ impl ApiClient {
         form.insert("clazzType", teaching_class_type);
         let clazz_id = course.id();
         let secret = course.secret();
+        if clazz_id.trim().is_empty()
+            || secret.trim().is_empty()
+            || teaching_class_type.trim().is_empty()
+        {
+            bail!("课程编号、选课类型或 secretVal 缺失，未发送选课请求；请重新抓取课程");
+        }
         form.insert("clazzId", clazz_id.as_str());
         form.insert("secretVal", secret.as_str());
         let body = json_response(
@@ -454,7 +543,101 @@ impl ApiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiClient, DEFAULT_AES_KEY, encrypt_password};
+    use super::{ApiClient, DEFAULT_AES_KEY, encrypt_password, parse_api_body};
+    use crate::model::Course;
+    use serde_json::json;
+
+    #[test]
+    fn html_login_page_is_identified_without_leaking_html_or_query() {
+        let url = reqwest::Url::parse(
+            "https://xk.neusoft.edu.cn/xsxk/profile/index.html?token=TEST_SECRET",
+        )
+        .unwrap();
+        let error = parse_api_body(
+            "<html><script>var loginVue = {}; var token='TEST_SECRET';</script></html>",
+            "选课接口",
+            200,
+            "text/html; charset=UTF-8",
+            &url,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("疑似登录页/会话失效"));
+        assert!(error.contains("/xsxk/profile/index.html"));
+        assert!(!error.contains("TEST_SECRET"));
+        assert!(!error.contains("<html>"));
+    }
+
+    #[test]
+    fn unknown_html_is_not_automatically_blamed_on_vpn() {
+        let url = reqwest::Url::parse("https://xk.neusoft.edu.cn/xsxk/elective/clazz/add").unwrap();
+        let error = parse_api_body(
+            "<html><title>TEST_SECRET</title></html>",
+            "选课接口",
+            200,
+            "text/html",
+            &url,
+        )
+        .err()
+        .unwrap();
+        assert!(!error.is::<crate::network::VpnRequired>());
+        let message = error.to_string();
+        assert!(message.contains("未识别的 HTML 页面"));
+        assert!(message.contains("结果未确认"));
+        assert!(!message.contains("TEST_SECRET"));
+    }
+
+    #[test]
+    fn response_diagnostics_distinguish_known_page_types() {
+        let url =
+            reqwest::Url::parse("https://xk.neusoft.edu.cn/error/TEST_SECRET?token=TEST_SECRET")
+                .unwrap();
+        for (body, expected) in [
+            ("<html>操作频繁</html>", "频率限制/安全验证"),
+            (
+                "<html><title>Whitelabel Error Page</title></html>",
+                "服务器错误页",
+            ),
+        ] {
+            let message = parse_api_body(body, "选课接口", 200, "text/html", &url)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(message.contains(expected));
+            assert!(!message.contains("TEST_SECRET"));
+        }
+    }
+
+    #[test]
+    fn json_response_requires_an_object_but_tolerates_mislabeled_mime_type() {
+        let url = reqwest::Url::parse("https://xk.neusoft.edu.cn/xsxk/elective/clazz/add").unwrap();
+        assert_eq!(
+            parse_api_body(
+                r#"{"code":200,"data":true}"#,
+                "选课接口",
+                200,
+                "text/html",
+                &url
+            )
+            .unwrap(),
+            json!({"code":200,"data":true})
+        );
+        assert!(parse_api_body("[]", "选课接口", 200, "application/json", &url).is_err());
+        assert!(parse_api_body("", "选课接口", 200, "text/html", &url).is_err());
+    }
+
+    #[test]
+    fn incomplete_course_is_rejected_before_network_submission() {
+        let api = ApiClient::new().unwrap();
+        let course = Course {
+            raw: json!({"JXBID":"dummy-course", "KCM":"dummy"}),
+        };
+        let error = api
+            .select_course("dummy-token", "dummy-batch", "XGKC", &course)
+            .unwrap_err();
+        assert!(error.to_string().contains("未发送选课请求"));
+    }
 
     #[test]
     fn password_encryption_matches_python_version() {

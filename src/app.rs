@@ -43,6 +43,7 @@ enum WorkerEvent {
     RobFinished {
         successful: Vec<String>,
         pending: Vec<String>,
+        failure: Option<String>,
     },
     Error(String),
 }
@@ -52,7 +53,7 @@ impl WorkerEvent {
         if error.is::<VpnRequired>() {
             Self::VpnRequired {
                 task_finished: false,
-                detail: None,
+                detail: error.chain().nth(1).map(|_| error.to_string()),
             }
         } else {
             Self::Error(format!("{error:#}"))
@@ -364,6 +365,7 @@ impl XkApp {
             }
             let mut pending = courses;
             let mut successful = Vec::new();
+            let mut failure = None;
             for round in 1..=click_times {
                 if stopped.load(Ordering::Relaxed) {
                     break;
@@ -407,13 +409,9 @@ impl XkApp {
                             }
                         }
                         Err(error) => {
+                            failure = Some(stop_after_submission_error(&name, &error, &stopped));
                             if error.is::<VpnRequired>() {
-                                stopped.store(true, Ordering::Relaxed);
                                 let _ = tx.send(WorkerEvent::from_error(error));
-                            } else {
-                                let _ = tx.send(WorkerEvent::Status(format!(
-                                    "轮次 {round}/{click_times} | {name}: {error}"
-                                )));
                             }
                             next.push(course);
                         }
@@ -430,6 +428,7 @@ impl XkApp {
             let _ = tx.send(WorkerEvent::RobFinished {
                 successful,
                 pending: pending_names,
+                failure,
             });
         });
     }
@@ -551,7 +550,7 @@ impl XkApp {
                             return;
                         }
                         let _ = tx.send(WorkerEvent::Error(format!(
-                            "退选 {} 失败：{error:#}",
+                            "退选 {} 请求异常：{error:#}\n结果未确认，未继续选 B；请核对实际已选课程。",
                             current.name()
                         )));
                         return;
@@ -568,6 +567,7 @@ impl XkApp {
                         let _ = tx.send(WorkerEvent::RobFinished {
                             successful: vec![fresh_target.name()],
                             pending: Vec::new(),
+                            failure: None,
                         });
                         return;
                     }
@@ -578,11 +578,12 @@ impl XkApp {
                         });
                         return;
                     }
-                    result => {
-                        let reason = match result {
-                            Ok(body) => response_message(&body),
-                            Err(error) => format!("{error:#}"),
-                        };
+                    Err(error) => {
+                        let _ = tx.send(WorkerEvent::Error(format!("选 B 请求异常：{error:#}\nB 的结果未确认，已停止，未自动回选 A。请立即核对 A、B 的实际选课状态。")));
+                        return;
+                    }
+                    Ok(body) => {
+                        let reason = response_message(&body);
                         let rollback = session.api.select_course(
                             &session.token,
                             &batch.code,
@@ -615,6 +616,7 @@ impl XkApp {
                     target.name(),
                     current.name()
                 )],
+                failure: None,
             });
         });
     }
@@ -809,8 +811,18 @@ impl XkApp {
                 WorkerEvent::RobFinished {
                     successful,
                     pending,
+                    failure,
                 } => {
                     self.rob_running = false;
+                    if let Some(reason) = failure {
+                        self.status = "提交异常，任务已停止；请核对实际选课结果".to_owned();
+                        self.result_dialog = Some(format!(
+                            "{reason}\n\n此前报告成功：{}\n未完成或结果待核对：{}",
+                            display_names(&successful),
+                            display_names(&pending)
+                        ));
+                        continue;
+                    }
                     if !self.vpn_required {
                         self.status = "抢课任务结束".to_owned();
                     }
@@ -836,6 +848,11 @@ impl XkApp {
             }
         }
     }
+}
+
+fn stop_after_submission_error(name: &str, error: &anyhow::Error, stopped: &AtomicBool) -> String {
+    stopped.store(true, Ordering::Relaxed);
+    format!("{name}：{error:#}\n任务已停止，未继续重试。请先核对官方已选课程，确认本次提交结果。")
 }
 
 fn selection_succeeded(body: &Value) -> bool {
@@ -1242,7 +1259,7 @@ fn display_names(names: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerEvent, selection_succeeded, wait_interval};
+    use super::{WorkerEvent, selection_succeeded, stop_after_submission_error, wait_interval};
     use crate::network::VpnRequired;
     use serde_json::json;
     use std::{sync::atomic::AtomicBool, time::Instant};
@@ -1272,8 +1289,9 @@ mod tests {
             WorkerEvent::from_error(error),
             WorkerEvent::VpnRequired {
                 task_finished: false,
-                detail: None
+                detail: Some(detail)
             }
+            if detail == "验证码请求失败"
         ));
         assert!(matches!(
             WorkerEvent::from_error(anyhow::anyhow!("HTTP 401")),
@@ -1286,5 +1304,15 @@ mod tests {
         let start = Instant::now();
         wait_interval(60_000, &AtomicBool::new(true));
         assert!(start.elapsed().as_secs() < 1);
+    }
+
+    #[test]
+    fn uncertain_submission_stops_further_rounds() {
+        let stopped = AtomicBool::new(false);
+        let message =
+            stop_after_submission_error("测试课程", &anyhow::anyhow!("HTTP 200 HTML"), &stopped);
+        assert!(stopped.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(message.contains("未继续重试"));
+        assert!(message.contains("确认本次提交结果"));
     }
 }

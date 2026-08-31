@@ -59,10 +59,11 @@ pub fn authorize() -> Result<Vec<SessionCookie>> {
         process::{Command, Stdio},
     };
 
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     // Anonymous pipes keep session secrets out of command lines, files and logs.
     let mut child = Command::new(std::env::current_exe().context("无法定位授权程序")?)
         .arg("--vpn-auth-helper")
-        .creation_flags(0x08000000) // No console; the interactive WebView remains visible.
+        .creation_flags(CREATE_NO_WINDOW) // The interactive WebView remains visible.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
