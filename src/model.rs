@@ -2,10 +2,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Prefs {
     pub username: String,
     pub password: String,
     pub only_selectable: bool,
+    pub only_available: bool,
+    #[serde(alias = "select_when_available")]
+    pub select_any_available: bool,
+    pub auto_relogin: bool,
     pub page_interval_ms: u64,
     pub list_403_retry: usize,
     pub penalty_ms: u64,
@@ -20,6 +25,9 @@ impl Prefs {
     pub fn with_defaults() -> Self {
         Self {
             only_selectable: true,
+            only_available: false,
+            select_any_available: false,
+            auto_relogin: false,
             page_interval_ms: 1_800,
             list_403_retry: 10,
             penalty_ms: 1_500,
@@ -183,6 +191,10 @@ impl Course {
     }
 
     pub fn has_available_seat(&self) -> bool {
+        self.seat_availability() == Some(true)
+    }
+
+    pub fn seat_availability(&self) -> Option<bool> {
         let number = |keys: &[&str]| {
             keys.iter()
                 .map(|key| self.text(key))
@@ -192,7 +204,7 @@ impl Course {
             number(&["KRL", "classCapacity"]),
             number(&["YXRS", "numberOfSelected"]),
         ) {
-            return selected < capacity;
+            return Some(selected < capacity);
         }
         ["QXKCKRL", "YXRSKRL"]
             .iter()
@@ -201,7 +213,6 @@ impl Course {
                 let (selected, capacity) = value.split_once('/')?;
                 Some(selected.trim().parse::<i64>().ok()? < capacity.trim().parse::<i64>().ok()?)
             })
-            .unwrap_or(false)
     }
 
     pub fn has_conflict(&self) -> bool {
@@ -224,7 +235,7 @@ impl Course {
 
 #[cfg(test)]
 mod tests {
-    use super::Course;
+    use super::{Course, Prefs};
     use serde_json::json;
 
     #[test]
@@ -285,6 +296,13 @@ mod tests {
         };
         assert!(available.has_available_seat());
         assert!(!full.has_available_seat());
+        assert_eq!(
+            Course {
+                raw: json!({"KCM":"余量字段缺失"})
+            }
+            .seat_availability(),
+            None
+        );
     }
 
     #[test]
@@ -301,5 +319,27 @@ mod tests {
             }
             .enrolled()
         );
+    }
+
+    #[test]
+    fn older_preferences_keep_credentials_when_new_options_are_missing() {
+        let prefs: Prefs = serde_json::from_value(json!({
+            "username":"20260001",
+            "password":"saved"
+        }))
+        .unwrap();
+        assert_eq!(prefs.username, "20260001");
+        assert_eq!(prefs.password, "saved");
+        assert!(!prefs.only_available);
+        assert!(!prefs.auto_relogin);
+    }
+
+    #[test]
+    fn previous_monitor_preference_migrates_to_any_available_mode() {
+        let prefs: Prefs = serde_json::from_value(json!({
+            "select_when_available": true
+        }))
+        .unwrap();
+        assert!(prefs.select_any_available);
     }
 }

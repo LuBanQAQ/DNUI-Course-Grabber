@@ -1,4 +1,5 @@
 use std::{collections::HashMap, sync::Arc, thread, time::Duration};
+use std::{error::Error as StdError, fmt};
 
 use aes::Aes128;
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,6 +41,27 @@ pub struct LoginSession {
     pub batches: Vec<Batch>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct SessionExpired;
+
+impl fmt::Display for SessionExpired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "登录会话已失效：接口返回了登录页。请重新登录；如已开启“掉线自动登录”，程序会自动恢复一次",
+        )
+    }
+}
+
+impl StdError for SessionExpired {}
+
+fn looks_like_login_page(text: &str, final_url: &reqwest::Url) -> bool {
+    let lower = text.to_ascii_lowercase();
+    final_url.path() == "/xsxk/profile/index.html"
+        || lower.contains("loginvue")
+        || lower.contains("loginform")
+        || (lower.contains("type=\"password\"") && text.contains("登录"))
+}
+
 fn json_response(response: Response, stage: &str) -> Result<Value> {
     let status = response.status();
     let final_url = response.url().clone();
@@ -72,16 +94,10 @@ fn parse_api_body(
     if lower.contains("vpn.neuedu.com") {
         return Err(VpnRequired.into());
     }
-    let (kind, guidance) = if final_url.path() == "/xsxk/profile/index.html"
-        || lower.contains("loginvue")
-        || lower.contains("loginform")
-        || (lower.contains("type=\"password\"") && text.contains("登录"))
-    {
-        (
-            "疑似登录页/会话失效",
-            "请关闭旧版和其他重复登录的程序，再重新登录并刷新课程；不要继续使用旧会话",
-        )
-    } else if [
+    if looks_like_login_page(text, final_url) {
+        return Err(SessionExpired.into());
+    }
+    let (kind, guidance) = if [
         "请求过于频繁",
         "操作频繁",
         "访问频繁",
@@ -158,6 +174,27 @@ fn message(value: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("未知错误")
         .to_owned()
+}
+
+fn course_list_payload(
+    teaching_class_type: &str,
+    page: usize,
+    page_size: usize,
+    campus: &str,
+    only_available: bool,
+) -> Value {
+    let mut payload = json!({
+        "teachingClassType": teaching_class_type,
+        "pageNumber": page,
+        "pageSize": page_size,
+        "orderBy": "",
+        "campus": campus,
+    });
+    if only_available {
+        // Captured official-page request: SFYM=0 means “not full”.
+        payload["SFYM"] = Value::String("0".to_owned());
+    }
+    payload
 }
 
 fn encrypt_password(password: &str, key: &str) -> Result<String> {
@@ -396,18 +433,64 @@ impl ApiClient {
         retry_403: usize,
         penalty_ms: u64,
     ) -> Result<(Vec<Course>, usize)> {
+        self.fetch_courses_filtered(
+            token,
+            batch_id,
+            teaching_class_type,
+            campus,
+            page_size,
+            interval_ms,
+            retry_403,
+            penalty_ms,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fetch_available_courses(
+        &self,
+        token: &str,
+        batch_id: &str,
+        teaching_class_type: &str,
+        campus: &str,
+        page_size: usize,
+        interval_ms: u64,
+        retry_403: usize,
+        penalty_ms: u64,
+    ) -> Result<(Vec<Course>, usize)> {
+        self.fetch_courses_filtered(
+            token,
+            batch_id,
+            teaching_class_type,
+            campus,
+            page_size,
+            interval_ms,
+            retry_403,
+            penalty_ms,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_courses_filtered(
+        &self,
+        token: &str,
+        batch_id: &str,
+        teaching_class_type: &str,
+        campus: &str,
+        page_size: usize,
+        interval_ms: u64,
+        retry_403: usize,
+        penalty_ms: u64,
+        only_available: bool,
+    ) -> Result<(Vec<Course>, usize)> {
         let mut rows = Vec::new();
         let mut page = 1usize;
         let mut total = 0usize;
         let mut fetched_course_groups = 0usize;
         loop {
-            let payload = json!({
-                "teachingClassType": teaching_class_type,
-                "pageNumber": page,
-                "pageSize": page_size,
-                "orderBy": "",
-                "campus": campus,
-            });
+            let payload =
+                course_list_payload(teaching_class_type, page, page_size, campus, only_available);
             let mut response_body = Value::Null;
             for attempt in 0..=retry_403 {
                 response_body = json_response(
@@ -470,9 +553,18 @@ impl ApiClient {
     }
 
     pub fn heartbeat(&self, token: &str) -> Result<()> {
-        self.common(self.client.post(format!("{}/web/now", self.api)))
+        let response = self
+            .common(self.client.post(format!("{}/web/now", self.api)))
             .header(AUTHORIZATION, token)
             .send_checked("保活接口")?;
+        let final_url = response.url().clone();
+        let text = response
+            .text()
+            .map_err(reqwest::Error::without_url)
+            .context("读取保活响应失败")?;
+        if looks_like_login_page(&text, &final_url) {
+            return Err(SessionExpired.into());
+        }
         Ok(())
     }
 
@@ -543,7 +635,10 @@ impl ApiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiClient, DEFAULT_AES_KEY, encrypt_password, parse_api_body};
+    use super::{
+        ApiClient, DEFAULT_AES_KEY, SessionExpired, course_list_payload, encrypt_password,
+        parse_api_body,
+    };
     use crate::model::Course;
     use serde_json::json;
 
@@ -561,12 +656,12 @@ mod tests {
             &url,
         )
         .err()
-        .unwrap()
-        .to_string();
-        assert!(error.contains("疑似登录页/会话失效"));
-        assert!(error.contains("/xsxk/profile/index.html"));
-        assert!(!error.contains("TEST_SECRET"));
-        assert!(!error.contains("<html>"));
+        .unwrap();
+        assert!(error.is::<SessionExpired>());
+        let message = error.to_string();
+        assert!(message.contains("登录会话已失效"));
+        assert!(!message.contains("TEST_SECRET"));
+        assert!(!message.contains("<html>"));
     }
 
     #[test]
@@ -625,6 +720,19 @@ mod tests {
         );
         assert!(parse_api_body("[]", "选课接口", 200, "application/json", &url).is_err());
         assert!(parse_api_body("", "选课接口", 200, "text/html", &url).is_err());
+    }
+
+    #[test]
+    fn available_course_query_matches_captured_official_filter() {
+        let filtered = course_list_payload("XGKC", 1, 10, "1", true);
+        assert_eq!(filtered["SFYM"], "0");
+        assert_eq!(filtered["teachingClassType"], "XGKC");
+        assert_eq!(filtered["pageNumber"], 1);
+        assert_eq!(filtered["pageSize"], 10);
+        assert_eq!(filtered["campus"], "1");
+
+        let unfiltered = course_list_payload("XGKC", 1, 10, "1", false);
+        assert!(unfiltered.get("SFYM").is_none());
     }
 
     #[test]

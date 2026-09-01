@@ -3,7 +3,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -17,7 +17,7 @@ use egui_extras::{Column, TableBuilder};
 use serde_json::Value;
 
 use crate::{
-    api::{ApiClient, LoginSession},
+    api::{ApiClient, LoginSession, SessionExpired},
     model::{Batch, Course, Prefs},
     network::{VPN_GUIDANCE, VPN_PORTAL, VpnRequired},
 };
@@ -32,6 +32,7 @@ enum WorkerEvent {
         detail: Option<String>,
     },
     LoginReady(LoginSession),
+    SessionRefreshed(LoginSession),
     Courses {
         session: LoginSession,
         batch: Batch,
@@ -46,6 +47,85 @@ enum WorkerEvent {
         failure: Option<String>,
     },
     Error(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlPage {
+    Account,
+    Courses,
+    Task,
+    Advanced,
+}
+
+#[derive(Clone)]
+struct AutoRelogin {
+    enabled: bool,
+    used: Arc<AtomicBool>,
+    gate: Arc<Mutex<()>>,
+    session: Arc<Mutex<LoginSession>>,
+    username: String,
+    password: String,
+    batch: Batch,
+    tx: Sender<WorkerEvent>,
+}
+
+impl AutoRelogin {
+    fn current_session(&self) -> anyhow::Result<LoginSession> {
+        self.session
+            .lock()
+            .map(|session| session.clone())
+            .map_err(|_| anyhow::anyhow!("登录会话状态异常"))
+    }
+
+    fn recover(&self) -> anyhow::Result<bool> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("自动登录锁异常"))?;
+        if self.used.swap(true, Ordering::SeqCst) {
+            // Another worker (usually heartbeat) may have just refreshed the shared session.
+            // Re-run the operation with that session, but never perform a second login.
+            return Ok(true);
+        }
+        let _ = self.tx.send(WorkerEvent::Status(
+            "检测到登录会话失效，正在自动重新登录（本任务最多一次）...".to_owned(),
+        ));
+        let session = ApiClient::login(&self.username, &self.password, 5)
+            .map_err(|error| error.context("掉线自动登录失败"))?;
+        session
+            .api
+            .bind_batch(&session.token, &self.batch.code)
+            .map_err(|error| error.context("自动登录后重新进入课程轮次失败"))?;
+        *self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("登录会话状态异常"))? = session.clone();
+        let _ = self.tx.send(WorkerEvent::SessionRefreshed(session.clone()));
+        let _ = self.tx.send(WorkerEvent::Status(
+            "自动重新登录成功，已恢复当前轮次并继续任务".to_owned(),
+        ));
+        Ok(true)
+    }
+}
+
+fn with_auto_relogin<T>(
+    relogin: &AutoRelogin,
+    mut operation: impl FnMut(&LoginSession) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let session = relogin.current_session()?;
+    match operation(&session) {
+        Err(error) if error.is::<SessionExpired>() => {
+            if relogin.recover()? {
+                operation(&relogin.current_session()?)
+            } else {
+                Err(error)
+            }
+        }
+        result => result,
+    }
 }
 
 impl WorkerEvent {
@@ -84,6 +164,7 @@ pub struct XkApp {
     stopped: Arc<AtomicBool>,
     result_dialog: Option<String>,
     vpn_required: bool,
+    control_page: ControlPage,
 }
 
 impl XkApp {
@@ -142,6 +223,7 @@ impl XkApp {
             stopped: Arc::new(AtomicBool::new(false)),
             result_dialog: None,
             vpn_required: false,
+            control_page: ControlPage::Account,
         }
     }
 
@@ -298,18 +380,33 @@ impl XkApp {
             .iter()
             .filter_map(|index| self.courses.get(*index).cloned())
             .collect();
-        if courses.is_empty() {
+        let select_any_available = self.prefs.select_any_available;
+        if courses.is_empty() && !select_any_available {
             self.result_dialog = Some("请先勾选至少一门课程".to_owned());
             return;
         }
         let class_type = self.teaching_class_type.clone();
+        let campus = self.campus.clone();
         let click_times = self.prefs.click_times.max(1);
         let click_interval = self.prefs.click_interval_ms;
+        let list_retries = self.prefs.list_403_retry;
+        let penalty_ms = self.prefs.penalty_ms;
         let keep_alive = self.prefs.keep_alive;
         let keep_alive_seconds = self.prefs.keep_alive_seconds.max(1);
         let schedule = self.prefs.scheduled_start.trim().to_owned();
+        let relogin = AutoRelogin {
+            enabled: self.prefs.auto_relogin,
+            used: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(Mutex::new(())),
+            session: Arc::new(Mutex::new(session)),
+            username: self.prefs.username.trim().to_owned(),
+            password: self.prefs.password.clone(),
+            batch: batch.clone(),
+            tx: self.tx.clone(),
+        };
         self.save_prefs();
         self.rob_running = true;
+        self.control_page = ControlPage::Task;
         self.paused.store(false, Ordering::Relaxed);
         self.stopped.store(false, Ordering::Relaxed);
         let paused = self.paused.clone();
@@ -318,7 +415,7 @@ impl XkApp {
         thread::spawn(move || {
             let heartbeat_finished = Arc::new(AtomicBool::new(false));
             let heartbeat = if keep_alive {
-                let heartbeat_session = session.clone();
+                let heartbeat_relogin = relogin.clone();
                 let heartbeat_stopped = stopped.clone();
                 let heartbeat_finished = heartbeat_finished.clone();
                 let heartbeat_tx = tx.clone();
@@ -326,8 +423,9 @@ impl XkApp {
                     while !heartbeat_stopped.load(Ordering::Relaxed)
                         && !heartbeat_finished.load(Ordering::Relaxed)
                     {
-                        let status = match heartbeat_session.api.heartbeat(&heartbeat_session.token)
-                        {
+                        let status = match with_auto_relogin(&heartbeat_relogin, |session| {
+                            session.api.heartbeat(&session.token)
+                        }) {
                             Ok(()) => "保活成功".to_owned(),
                             Err(error) if error.is::<VpnRequired>() => {
                                 heartbeat_stopped.store(true, Ordering::Relaxed);
@@ -365,7 +463,9 @@ impl XkApp {
             }
             let mut pending = courses;
             let mut successful = Vec::new();
+            let mut successful_ids = BTreeSet::new();
             let mut failure = None;
+            let mut any_course_selected = false;
             for round in 1..=click_times {
                 if stopped.load(Ordering::Relaxed) {
                     break;
@@ -373,8 +473,57 @@ impl XkApp {
                 while paused.load(Ordering::Relaxed) && !stopped.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(100));
                 }
-                if pending.is_empty() || stopped.load(Ordering::Relaxed) {
+                if (!select_any_available && pending.is_empty()) || stopped.load(Ordering::Relaxed)
+                {
                     break;
+                }
+                if select_any_available {
+                    let refreshed = with_auto_relogin(&relogin, |session| {
+                        session.api.fetch_available_courses(
+                            &session.token,
+                            &batch.code,
+                            &class_type,
+                            &campus,
+                            100,
+                            1_500,
+                            list_retries,
+                            penalty_ms,
+                        )
+                    });
+                    match refreshed {
+                        Ok((fresh, _)) => {
+                            let ready = available_candidates(fresh, &successful_ids);
+                            let _ = tx.send(WorkerEvent::Status(format!(
+                                "任意未满课程查询 {round}/{click_times}：发现 {} 门可选课程",
+                                ready.len()
+                            )));
+                            if ready.is_empty() {
+                                pending.clear();
+                                wait_interval(click_interval.max(500), &stopped);
+                                continue;
+                            }
+                            pending = ready;
+                        }
+                        Err(error) if error.is::<SessionExpired>() => {
+                            failure = Some(format!(
+                                "登录会话已失效，且未能自动恢复：{error:#}\n任务已停止，请重新登录后再试。"
+                            ));
+                            stopped.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(error) => {
+                            if error.is::<VpnRequired>() {
+                                let _ = tx.send(WorkerEvent::from_error(error));
+                                stopped.store(true, Ordering::Relaxed);
+                            } else {
+                                let _ = tx.send(WorkerEvent::Status(format!(
+                                    "余量监控 {round}/{click_times} 刷新失败：{error:#}"
+                                )));
+                            }
+                            wait_interval(click_interval.max(500), &stopped);
+                            continue;
+                        }
+                    }
                 }
                 let mut next = Vec::new();
                 for course in pending {
@@ -390,12 +539,15 @@ impl XkApp {
                         continue;
                     }
                     let name = course.name();
-                    match session.api.select_course(
-                        &session.token,
-                        &batch.code,
-                        &class_type,
-                        &course,
-                    ) {
+                    if select_any_available && !course.has_available_seat() {
+                        next.push(course);
+                        continue;
+                    }
+                    match with_auto_relogin(&relogin, |session| {
+                        session
+                            .api
+                            .select_course(&session.token, &batch.code, &class_type, &course)
+                    }) {
                         Ok(body) => {
                             let code = body.get("code").and_then(Value::as_i64).unwrap_or_default();
                             let msg = body.get("msg").and_then(Value::as_str).unwrap_or("");
@@ -403,7 +555,12 @@ impl XkApp {
                                 "轮次 {round}/{click_times} | {name}: code={code}, {msg}"
                             )));
                             if selection_succeeded(&body) {
+                                successful_ids.insert(course.id());
                                 successful.push(name);
+                                if select_any_available {
+                                    any_course_selected = true;
+                                    break;
+                                }
                             } else {
                                 next.push(course);
                             }
@@ -419,6 +576,9 @@ impl XkApp {
                     wait_interval(click_interval, &stopped);
                 }
                 pending = next;
+                if any_course_selected {
+                    break;
+                }
             }
             heartbeat_finished.store(true, Ordering::Relaxed);
             if let Some(heartbeat) = heartbeat {
@@ -464,23 +624,37 @@ impl XkApp {
         let penalty_ms = self.prefs.penalty_ms;
         let tx = self.tx.clone();
         let stopped = self.stopped.clone();
+        let relogin = AutoRelogin {
+            enabled: self.prefs.auto_relogin,
+            used: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(Mutex::new(())),
+            session: Arc::new(Mutex::new(session)),
+            username: self.prefs.username.trim().to_owned(),
+            password: self.prefs.password.clone(),
+            batch: batch.clone(),
+            tx: self.tx.clone(),
+        };
+        self.save_prefs();
         self.rob_running = true;
+        self.control_page = ControlPage::Task;
         self.stopped.store(false, Ordering::Relaxed);
         thread::spawn(move || {
             for round in 1..=rounds {
                 if stopped.load(Ordering::Relaxed) {
                     break;
                 }
-                let fresh = session.api.fetch_courses(
-                    &session.token,
-                    &batch.code,
-                    &class_type,
-                    &campus,
-                    500,
-                    1_500,
-                    retries,
-                    penalty_ms,
-                );
+                let fresh = with_auto_relogin(&relogin, |session| {
+                    session.api.fetch_available_courses(
+                        &session.token,
+                        &batch.code,
+                        &class_type,
+                        &campus,
+                        100,
+                        1_500,
+                        retries,
+                        penalty_ms,
+                    )
+                });
                 let (courses, _) = match fresh {
                     Ok(courses) => courses,
                     Err(error) if error.is::<VpnRequired>() => {
@@ -488,6 +662,12 @@ impl XkApp {
                             task_finished: true,
                             detail: Some("VPN 验证失效，换课已停止；尚未提交退课请求。".to_owned()),
                         });
+                        return;
+                    }
+                    Err(error) if error.is::<SessionExpired>() => {
+                        let _ = tx.send(WorkerEvent::Error(format!(
+                            "换课监控检测到登录会话失效，且未能自动恢复：{error:#}"
+                        )));
                         return;
                     }
                     Err(error) => {
@@ -506,9 +686,11 @@ impl XkApp {
                     .find(|course| course.id() == target.id())
                 else {
                     let _ = tx.send(WorkerEvent::Status(format!(
-                        "换课轮次 {round}/{rounds}：未找到目标 {}",
-                        target.name()
+                        "未满课程查询 {round}/{rounds}：{} 暂无余量，保留 {}",
+                        target.name(),
+                        current.name()
                     )));
+                    wait_interval(interval.max(500), &stopped);
                     continue;
                 };
                 if !fresh_target.has_available_seat() {
@@ -525,11 +707,13 @@ impl XkApp {
                     target.name(),
                     current.name()
                 )));
-                match session
-                    .api
-                    .drop_course(&session.token, &batch.code, &class_type, &current)
-                {
-                    Ok(body) if response_accepted(&body) => {}
+                let drop_result = relogin.current_session().and_then(|session| {
+                    session
+                        .api
+                        .drop_course(&session.token, &batch.code, &class_type, &current)
+                });
+                match drop_result {
+                    Ok(body) if selection_succeeded(&body) => {}
                     Ok(body) => {
                         let _ = tx.send(WorkerEvent::Error(format!(
                             "退选 {} 失败：{}",
@@ -557,13 +741,16 @@ impl XkApp {
                     }
                 }
                 thread::sleep(Duration::from_millis(300));
-                match session.api.select_course(
-                    &session.token,
-                    &batch.code,
-                    &class_type,
-                    &fresh_target,
-                ) {
-                    Ok(body) if response_accepted(&body) => {
+                let select_result = relogin.current_session().and_then(|session| {
+                    session.api.select_course(
+                        &session.token,
+                        &batch.code,
+                        &class_type,
+                        &fresh_target,
+                    )
+                });
+                match select_result {
+                    Ok(body) if selection_succeeded(&body) => {
                         let _ = tx.send(WorkerEvent::RobFinished {
                             successful: vec![fresh_target.name()],
                             pending: Vec::new(),
@@ -584,14 +771,16 @@ impl XkApp {
                     }
                     Ok(body) => {
                         let reason = response_message(&body);
-                        let rollback = session.api.select_course(
-                            &session.token,
-                            &batch.code,
-                            &class_type,
-                            &current,
-                        );
+                        let rollback = relogin.current_session().and_then(|session| {
+                            session.api.select_course(
+                                &session.token,
+                                &batch.code,
+                                &class_type,
+                                &current,
+                            )
+                        });
                         let rollback_text = match rollback {
-                            Ok(body) if response_accepted(&body) => "已尝试回选 A".to_owned(),
+                            Ok(body) if selection_succeeded(&body) => "已尝试回选 A".to_owned(),
                             Ok(body) => format!("回选 A 失败：{}", response_message(&body)),
                             Err(error) if error.is::<VpnRequired>() => {
                                 let _ = tx.send(WorkerEvent::VpnRequired {
@@ -627,10 +816,7 @@ impl XkApp {
             .courses
             .iter()
             .enumerate()
-            .filter(|(_, course)| {
-                !self.prefs.only_selectable || course.selectable() || course.enrolled()
-            })
-            .filter(|(_, course)| needle.is_empty() || course.searchable_text().contains(&needle))
+            .filter(|(_, course)| course_visible(course, &self.prefs, &needle))
             .map(|(index, _)| index)
             .collect();
 
@@ -682,7 +868,11 @@ impl XkApp {
                     let status = if course.enrolled() {
                         "已选"
                     } else if course.selectable() {
-                        "可选"
+                        match course.seat_availability() {
+                            Some(true) => "未满·可选",
+                            Some(false) => "已满",
+                            None => "可选·余量未知",
+                        }
                     } else if course.has_conflict() {
                         "冲突"
                     } else {
@@ -723,6 +913,213 @@ impl XkApp {
             });
     }
 
+    fn render_control_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (page, title) in [
+                (ControlPage::Account, "账号与网络"),
+                (ControlPage::Courses, "课程筛选"),
+                (ControlPage::Task, "抢课任务"),
+                (ControlPage::Advanced, "高级设置"),
+            ] {
+                ui.selectable_value(&mut self.control_page, page, title);
+            }
+        });
+        ui.separator();
+        match self.control_page {
+            ControlPage::Account => self.render_account_page(ui),
+            ControlPage::Courses => self.render_course_page(ui),
+            ControlPage::Task => self.render_task_page(ui),
+            ControlPage::Advanced => self.render_advanced_page(ui),
+        }
+    }
+
+    fn render_account_page(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("account-settings")
+            .num_columns(4)
+            .spacing([14.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("学号");
+                ui.add_sized(
+                    [220.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.prefs.username),
+                );
+                ui.label("密码");
+                ui.add_sized(
+                    [240.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.prefs.password).password(true),
+                );
+                ui.end_row();
+            });
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.busy && !self.rob_running,
+                    egui::Button::new("登录并抓取课程"),
+                )
+                .clicked()
+            {
+                self.login();
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !self.rob_running,
+                    egui::Button::new("检测校园网/VPN"),
+                )
+                .clicked()
+            {
+                self.check_network();
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !self.rob_running,
+                    egui::Button::new("VPN 浏览器授权"),
+                )
+                .clicked()
+            {
+                self.authorize_vpn();
+            }
+            ui.hyperlink_to("打开校园 VPN", VPN_PORTAL);
+        });
+        if self.vpn_required {
+            ui.colored_label(egui::Color32::from_rgb(160, 70, 0), VPN_GUIDANCE);
+        }
+    }
+
+    fn render_course_page(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("搜索课程");
+            ui.add_sized(
+                [320.0, 30.0],
+                egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text("课程号 / 课程名 / 教师 / 上课地点"),
+            );
+            ui.checkbox(&mut self.prefs.only_selectable, "仅显示可选课程");
+            ui.checkbox(&mut self.prefs.only_available, "仅显示未满课程")
+                .on_hover_text("已选课程仍会保留显示，便于有位换课");
+        });
+        ui.horizontal(|ui| {
+            ui.label(format!("课程 {} 门", self.courses.len()));
+            ui.separator();
+            ui.label(format!("已勾选 {} 门", self.selected_courses.len()));
+            if let Some(batch) = &self.current_batch {
+                ui.separator();
+                ui.label(format!("当前轮次：{}", batch.name));
+            }
+        });
+    }
+
+    fn render_task_page(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut self.prefs.select_any_available,
+                "任意未满课程自动选（无需勾选）",
+            )
+                .on_hover_text("持续 POST 查询未满课程（SFYM=0），按返回顺序尝试，第一门成功后停止");
+            ui.checkbox(&mut self.prefs.auto_relogin, "掉线自动登录")
+                .on_hover_text("仅在明确返回登录页时触发；每个任务最多一次。换课已开始退 A 后不会重放不确定请求");
+            ui.checkbox(&mut self.prefs.keep_alive, "保活防踢");
+        });
+        egui::Grid::new("task-settings")
+            .num_columns(6)
+            .spacing([14.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("定时开始");
+                ui.add_sized(
+                    [150.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.prefs.scheduled_start)
+                        .hint_text("HH:MM:SS / 留空立即"),
+                );
+                ui.label("轮数");
+                ui.add(egui::DragValue::new(&mut self.prefs.click_times).range(1..=100_000));
+                ui.label("点击间隔(ms)");
+                ui.add(egui::DragValue::new(&mut self.prefs.click_interval_ms).range(0..=60_000));
+                ui.end_row();
+            });
+        let selected_count = self.selected_courses.len();
+        if self.prefs.select_any_available {
+            ui.colored_label(
+                egui::Color32::from_rgb(170, 60, 0),
+                "任意课程模式：无需勾选目标，将按查询顺序尝试，并在第一门选课成功后停止",
+            );
+        } else if selected_count == 0 {
+            ui.colored_label(
+                egui::Color32::from_rgb(170, 90, 0),
+                "尚未勾选目标课程，请先到“课程筛选”页选择至少一门课程",
+            );
+        } else {
+            ui.label(format!("已勾选 {selected_count} 门目标课程"));
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.busy
+                        && !self.rob_running
+                        && (self.prefs.select_any_available || selected_count > 0),
+                    egui::Button::new(if self.prefs.select_any_available {
+                        "开始任意课程监控"
+                    } else {
+                        "开始抢选中课程"
+                    }),
+                )
+                .clicked()
+            {
+                self.start_rob();
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !self.rob_running,
+                    egui::Button::new("有位换课 A → B"),
+                )
+                .on_hover_text("勾选当前已选 A 和目标 B；确认 B 有余量后才退 A")
+                .clicked()
+            {
+                self.start_swap();
+            }
+            if ui
+                .add_enabled(
+                    self.rob_running,
+                    egui::Button::new(if self.paused.load(Ordering::Relaxed) {
+                        "继续任务"
+                    } else {
+                        "暂停任务"
+                    }),
+                )
+                .clicked()
+            {
+                let next = !self.paused.load(Ordering::Relaxed);
+                self.paused.store(next, Ordering::Relaxed);
+            }
+            if ui
+                .add_enabled(self.rob_running, egui::Button::new("终止任务"))
+                .clicked()
+            {
+                self.stopped.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
+    fn render_advanced_page(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("advanced-settings")
+            .num_columns(6)
+            .spacing([14.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("列表抓取间隔(ms)");
+                ui.add(egui::DragValue::new(&mut self.prefs.page_interval_ms).range(0..=60_000));
+                ui.label("403 重试次数");
+                ui.add(egui::DragValue::new(&mut self.prefs.list_403_retry).range(0..=50));
+                ui.label("403 罚时(ms)");
+                ui.add(egui::DragValue::new(&mut self.prefs.penalty_ms).range(0..=60_000));
+                ui.end_row();
+                ui.label("保活间隔(s)");
+                ui.add(egui::DragValue::new(&mut self.prefs.keep_alive_seconds).range(1..=3_600));
+                ui.label("说明");
+                ui.label("403 罚时和点击间隔支持 0；分页抓取最低 1.5 秒");
+                ui.label("");
+                ui.label("");
+                ui.end_row();
+            });
+    }
+
     fn poll_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -750,6 +1147,7 @@ impl XkApp {
                     self.stopped.store(true, Ordering::Relaxed);
                     self.paused.store(false, Ordering::Relaxed);
                     self.vpn_required = true;
+                    self.control_page = ControlPage::Account;
                     self.login_session = None;
                     self.batch_dialog = false;
                     if task_finished {
@@ -778,6 +1176,12 @@ impl XkApp {
                     self.batch_dialog = true;
                     self.status = "登录成功，请选择课程轮次".to_owned();
                 }
+                WorkerEvent::SessionRefreshed(session) => {
+                    self.batches = session.batches.clone();
+                    self.login_session = Some(session);
+                    self.vpn_required = false;
+                    self.status = "自动重新登录成功，任务继续运行".to_owned();
+                }
                 WorkerEvent::Courses {
                     session,
                     batch,
@@ -796,6 +1200,7 @@ impl XkApp {
                     );
                     self.login_session = Some(session);
                     self.current_batch = Some(batch);
+                    self.control_page = ControlPage::Courses;
                     self.teaching_class_type = teaching_class_type;
                     self.campus = campus;
                     self.courses = courses;
@@ -850,6 +1255,24 @@ impl XkApp {
     }
 }
 
+fn course_visible(course: &Course, prefs: &Prefs, needle: &str) -> bool {
+    let selectable = !prefs.only_selectable || course.selectable() || course.enrolled();
+    let available = !prefs.only_available || course.has_available_seat() || course.enrolled();
+    let searchable = needle.is_empty() || course.searchable_text().contains(needle);
+    selectable && available && searchable
+}
+
+fn available_candidates(courses: Vec<Course>, successful_ids: &BTreeSet<String>) -> Vec<Course> {
+    courses
+        .into_iter()
+        .filter(|course| {
+            course.selectable()
+                && course.has_available_seat()
+                && !successful_ids.contains(&course.id())
+        })
+        .collect()
+}
+
 fn stop_after_submission_error(name: &str, error: &anyhow::Error, stopped: &AtomicBool) -> String {
     stopped.store(true, Ordering::Relaxed);
     format!("{name}：{error:#}\n任务已停止，未继续重试。请先核对官方已选课程，确认本次提交结果。")
@@ -873,10 +1296,6 @@ fn selection_succeeded(body: &Value) -> bool {
     data_succeeded || message_succeeded
 }
 
-fn response_accepted(body: &Value) -> bool {
-    body.get("code").and_then(Value::as_i64) == Some(200) || selection_succeeded(body)
-}
-
 fn response_message(body: &Value) -> String {
     body.get("msg")
         .or_else(|| body.get("message"))
@@ -894,240 +1313,57 @@ impl eframe::App for XkApp {
             .rect_filled(ui.max_rect(), 0.0, egui::Color32::from_rgb(242, 247, 253));
         ui.vertical(|ui| {
             ui.add_space(6.0);
-            let toolbar_width = ui.available_width();
             egui::Frame::new()
                 .fill(egui::Color32::from_rgb(252, 253, 255))
                 .stroke(egui::Stroke::new(
                     1.0,
                     egui::Color32::from_rgb(177, 197, 222),
                 ))
-                .corner_radius(egui::CornerRadius::same(10))
+                .corner_radius(egui::CornerRadius::same(12))
                 .inner_margin(16.0)
                 .show(ui, |ui| {
-                    ui.set_min_width((toolbar_width - 32.0).max(600.0));
                     ui.horizontal(|ui| {
-                        ui.heading("选课控制台");
+                        ui.heading("DNUI 选课助手");
                         ui.separator();
-                        ui.label("登录、课程抓取与抢课任务");
+                        ui.label(if self.rob_running {
+                            "任务运行中"
+                        } else if self.login_session.is_some() {
+                            "已登录"
+                        } else {
+                            "未登录"
+                        });
+                        if let Some(batch) = &self.current_batch {
+                            ui.separator();
+                            ui.label(format!("{} · {}", batch.name, self.teaching_class_type));
+                        }
                     });
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                !self.busy && !self.rob_running,
-                                egui::Button::new("VPN 浏览器授权"),
-                            )
-                            .clicked()
-                        {
-                            self.authorize_vpn();
-                        }
-                        ui.hyperlink_to("打开校园 VPN（校外先连接）", VPN_PORTAL);
-                        if ui
-                            .add_enabled(
-                                !self.busy && !self.rob_running,
-                                egui::Button::new(if self.vpn_required {
-                                    "重新检测网络"
-                                } else {
-                                    "检测校园网/VPN"
-                                }),
-                            )
-                            .clicked()
-                        {
-                            self.check_network();
-                        }
-                    });
-                    if self.vpn_required {
-                        ui.colored_label(egui::Color32::from_rgb(160, 70, 0), VPN_GUIDANCE);
-                    }
-                    egui::Grid::new("login-grid")
-                        .num_columns(6)
-                        .spacing([12.0, 9.0])
-                        .show(ui, |ui| {
-                            ui.label("学号");
-                            ui.add_sized(
-                                [180.0, 30.0],
-                                egui::TextEdit::singleline(&mut self.prefs.username),
-                            );
-                            ui.label("密码");
-                            ui.add_sized(
-                                [200.0, 30.0],
-                                egui::TextEdit::singleline(&mut self.prefs.password).password(true),
-                            );
-                            ui.checkbox(&mut self.prefs.only_selectable, "仅显示可选课程");
-                            if ui
-                                .add_enabled(
-                                    !self.busy && !self.rob_running,
-                                    egui::Button::new("登录并抓取本轮课程"),
-                                )
-                                .clicked()
-                            {
-                                self.login();
-                            }
-                            ui.end_row();
-                            ui.label("抓取间隔(ms)");
-                            ui.add(
-                                egui::DragValue::new(&mut self.prefs.page_interval_ms)
-                                    .range(0..=60_000),
-                            );
-                            ui.label("403 重试次数");
-                            ui.add(
-                                egui::DragValue::new(&mut self.prefs.list_403_retry).range(0..=50),
-                            );
-                            ui.label("搜索");
-                            ui.add_sized(
-                                [220.0, 30.0],
-                                egui::TextEdit::singleline(&mut self.filter)
-                                    .hint_text("课程号 / 课程名 / 教师"),
-                            );
-                            ui.end_row();
-                            ui.label("403罚时(ms)");
-                            ui.add(
-                                egui::DragValue::new(&mut self.prefs.penalty_ms).range(0..=60_000),
-                            );
-                            ui.label("0 表示不等待");
-                            ui.label("");
-                            ui.label("");
-                            ui.label("");
-                            ui.end_row();
-                            ui.label("定时(HH:MM:SS)");
-                            ui.add_sized(
-                                [180.0, 30.0],
-                                egui::TextEdit::singleline(&mut self.prefs.scheduled_start)
-                                    .hint_text("留空立即开始"),
-                            );
-                            ui.label("点击间隔(ms)");
-                            ui.add(
-                                egui::DragValue::new(&mut self.prefs.click_interval_ms)
-                                    .range(0..=60_000),
-                            );
-                            ui.label("点击轮数");
-                            ui.add(
-                                egui::DragValue::new(&mut self.prefs.click_times)
-                                    .range(1..=100_000),
-                            );
-                            ui.end_row();
-                            ui.checkbox(&mut self.prefs.keep_alive, "保活防踢");
-                            ui.label("保活间隔(s)");
-                            ui.add(
-                                egui::DragValue::new(&mut self.prefs.keep_alive_seconds)
-                                    .range(1..=3_600),
-                            );
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        !self.busy && !self.rob_running,
-                                        egui::Button::new("抢选中课程"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.start_rob();
-                                }
-                                if ui
-                                    .add_enabled(
-                                        !self.busy && !self.rob_running,
-                                        egui::Button::new("有位换课 A→B"),
-                                    )
-                                    .on_hover_text("勾选当前已选 A 和目标 B；仅在 B 有余量时退 A")
-                                    .clicked()
-                                {
-                                    self.start_swap();
-                                }
-                            });
-                            if ui
-                                .add_enabled(
-                                    self.rob_running,
-                                    egui::Button::new(if self.paused.load(Ordering::Relaxed) {
-                                        "继续抢课"
-                                    } else {
-                                        "暂停抢课"
-                                    }),
-                                )
-                                .clicked()
-                            {
-                                let next = !self.paused.load(Ordering::Relaxed);
-                                self.paused.store(next, Ordering::Relaxed);
-                            }
-                            if ui
-                                .add_enabled(self.rob_running, egui::Button::new("终止抢课"))
-                                .clicked()
-                            {
-                                self.stopped.store(true, Ordering::Relaxed);
-                            }
-                            ui.end_row();
-                        });
+                    self.render_control_tabs(ui);
                 });
             ui.add_space(6.0);
             egui::Frame::new()
-                .fill(egui::Color32::from_rgb(224, 237, 253))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(12, 7))
+                .fill(if self.vpn_required {
+                    egui::Color32::from_rgb(255, 239, 218)
+                } else {
+                    egui::Color32::from_rgb(224, 237, 253)
+                })
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
-                    ui.colored_label(egui::Color32::from_rgb(28, 79, 145), &self.status);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(if self.rob_running {
+                            "运行状态"
+                        } else {
+                            "状态"
+                        });
+                        ui.separator();
+                        ui.colored_label(egui::Color32::from_rgb(28, 79, 145), &self.status);
+                    });
                 });
             ui.add_space(4.0);
         });
 
         self.render_course_table(ui);
-        if false {
-            ui.vertical(|ui| {
-                let needle = self.filter.trim().to_lowercase();
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui::Grid::new("course-table")
-                            .striped(true)
-                            .min_col_width(75.0)
-                            .show(ui, |ui| {
-                                for header in [
-                                    "选择",
-                                    "课程号",
-                                    "课程名",
-                                    "课序号",
-                                    "教师",
-                                    "学分",
-                                    "课程类别",
-                                    "课容量",
-                                    "已选人数",
-                                    "状态",
-                                ] {
-                                    ui.strong(header);
-                                }
-                                ui.end_row();
-                                for (index, course) in self.courses.iter().enumerate() {
-                                    if self.prefs.only_selectable && !course.selectable() {
-                                        continue;
-                                    }
-                                    if !needle.is_empty()
-                                        && !course.searchable_text().contains(&needle)
-                                    {
-                                        continue;
-                                    }
-                                    let mut selected = self.selected_courses.contains(&index);
-                                    if ui.checkbox(&mut selected, "").changed() {
-                                        if selected {
-                                            self.selected_courses.insert(index);
-                                        } else {
-                                            self.selected_courses.remove(&index);
-                                        }
-                                    }
-                                    for key in
-                                        ["KCH", "KCM", "KXH", "SKJS", "XF", "KCLB", "KRL", "YXRS"]
-                                    {
-                                        ui.label(course.text(key));
-                                    }
-                                    ui.label(if course.selectable() {
-                                        "可选"
-                                    } else if course.has_conflict() {
-                                        "冲突"
-                                    } else {
-                                        "不可选"
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                    });
-            });
-        }
 
         if self.batch_dialog {
             egui::Window::new("选择选课轮次")
@@ -1259,10 +1495,14 @@ fn display_names(names: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerEvent, selection_succeeded, stop_after_submission_error, wait_interval};
+    use super::{
+        WorkerEvent, available_candidates, course_visible, selection_succeeded,
+        stop_after_submission_error, wait_interval,
+    };
+    use crate::model::{Course, Prefs};
     use crate::network::VpnRequired;
     use serde_json::json;
-    use std::{sync::atomic::AtomicBool, time::Instant};
+    use std::{collections::BTreeSet, sync::atomic::AtomicBool, time::Instant};
 
     #[test]
     fn http_success_code_does_not_hide_business_failure() {
@@ -1314,5 +1554,45 @@ mod tests {
         assert!(stopped.load(std::sync::atomic::Ordering::Relaxed));
         assert!(message.contains("未继续重试"));
         assert!(message.contains("确认本次提交结果"));
+    }
+
+    #[test]
+    fn available_filter_hides_full_courses_but_keeps_enrolled_course() {
+        let prefs = Prefs {
+            only_available: true,
+            ..Prefs::with_defaults()
+        };
+        let available = Course {
+            raw: json!({"SFKT":"1", "KRL":"30", "YXRS":"29"}),
+        };
+        let full = Course {
+            raw: json!({"SFKT":"1", "KRL":"30", "YXRS":"30"}),
+        };
+        let enrolled = Course {
+            raw: json!({"_enrolled":true, "KRL":"30", "YXRS":"30"}),
+        };
+        assert!(course_visible(&available, &prefs, ""));
+        assert!(!course_visible(&full, &prefs, ""));
+        assert!(course_visible(&enrolled, &prefs, ""));
+    }
+
+    #[test]
+    fn any_available_mode_uses_all_eligible_courses_without_targets() {
+        let courses = vec![
+            Course {
+                raw: json!({"JXBID":"A", "SFKT":"1", "SFCT":"0", "KRL":"30", "YXRS":"29"}),
+            },
+            Course {
+                raw: json!({"JXBID":"B", "SFKT":"1", "SFCT":"0", "KRL":"30", "YXRS":"28"}),
+            },
+            Course {
+                raw: json!({"JXBID":"C", "SFKT":"1", "SFCT":"1", "KRL":"30", "YXRS":"20"}),
+            },
+        ];
+        let mut already_successful = BTreeSet::new();
+        already_successful.insert("A".to_owned());
+        let candidates = available_candidates(courses, &already_successful);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id(), "B");
     }
 }
