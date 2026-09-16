@@ -1,4 +1,4 @@
-# 选课工具
+# DNUI金智教务抢课工具
 
 现有 Python/Tkinter 版本的独立 Rust 重构。功能包括：
 
