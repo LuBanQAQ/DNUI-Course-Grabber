@@ -28,3 +28,10 @@ cargo build --release
 ## 安全
 
 偏好和课程缓存保存在 `%LOCALAPPDATA%\DNUI-XK\`，不会在可执行文件目录生成 JSON 文件。仓库不会复制 Python 版的账号、密码或课程缓存。
+
+## 许可证
+
+本项目采用仓库内 `LICENSE` 所示的“DNUI-Course-Grabber 非商业使用许可证 v1.0”。
+
+- 禁止商业使用
+- 禁止倒卖与转售
