@@ -31,7 +31,4 @@ cargo build --release
 
 ## 许可证
 
-本项目采用仓库内 `LICENSE` 所示的“DNUI-Course-Grabber 非商业使用许可证 v1.0”。
-
-- 禁止商业使用
-- 禁止倒卖与转售
+本项目采用 [Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](https://creativecommons.org/licenses/by-nc/4.0/) 许可证。

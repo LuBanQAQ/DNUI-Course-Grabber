@@ -3,7 +3,7 @@ name = "xk-rust"
 version = "1.2.0"
 edition = "2024"
 description = "DNUI course selection desktop client rewritten in Rust"
-license = "MIT"
+license = "CC-BY-NC-4.0"
 
 [dependencies]
 aes = "0.8"
