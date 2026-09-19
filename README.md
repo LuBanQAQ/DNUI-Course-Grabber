@@ -28,3 +28,7 @@ cargo build --release
 ## 安全
 
 偏好和课程缓存保存在 `%LOCALAPPDATA%\DNUI-XK\`，不会在可执行文件目录生成 JSON 文件。仓库不会复制 Python 版的账号、密码或课程缓存。
+
+## 许可证
+
+本项目采用 [Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](https://creativecommons.org/licenses/by-nc/4.0/) 许可证。
